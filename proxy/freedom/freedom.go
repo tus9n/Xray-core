@@ -20,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/common/retry"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
+	"github.com/xtls/xray-core/common/speedlimit"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
@@ -45,6 +46,15 @@ func reloadEnvSettings() error {
 	switch value {
 	case defaultFlagValue, "auto", "enable":
 		enabled = true
+	}
+	// Marzban patch: splice() is a kernel-level zero-copy path that never
+	// goes through buf.Copy — our per-user speedlimit.WaitN wrapping around
+	// buf.Copy below would be silently bypassed for any connection eligible
+	// for it. Correctness (the cap never being skipped) matters more than
+	// the splice performance win here, so disable it outright whenever the
+	// limiter is active (SPEED_LIMIT_CONFIG_URL/TOKEN set).
+	if speedlimit.Enabled() {
+		enabled = false
 	}
 	useSplice.Store(enabled)
 	return nil
@@ -421,6 +431,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
+		// Marzban patch: per-user upload cap, see common/speedlimit. `up:
+		// true` — this is the client->destination direction (input is
+		// link.Reader, i.e. what the inbound decoded from the client).
+		if inbound != nil && inbound.User != nil {
+			writer = speedlimit.LimitWriter(ctx, writer, inbound.User.Email, inbound.Tag, true)
+		}
+
 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to process request").Base(err)
 		}
@@ -445,7 +462,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		} else {
 			reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
 		}
-		if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
+		// Marzban patch: per-user download cap, mirrors requestDone above.
+		// `up: false` — destination->client direction.
+		limitedOutput := output
+		if inbound != nil && inbound.User != nil {
+			limitedOutput = speedlimit.LimitWriter(ctx, output, inbound.User.Email, inbound.Tag, false)
+		}
+		if err := buf.Copy(reader, limitedOutput, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to process response").Base(err)
 		}
 		return nil
