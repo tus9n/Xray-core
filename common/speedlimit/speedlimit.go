@@ -12,22 +12,30 @@
 // reaches this package, xray has already resolved exactly which user it
 // belongs to.
 //
-// Fail-open by design everywhere: any error (config fetch failure, no
-// SPEED_LIMIT_CONFIG_URL set, unknown user/tag) results in NO limiting,
-// never a blocked or dropped connection. This is a bandwidth cap, not an
-// access control — the failure mode of "no limit" is always safe; the
-// failure mode of "connection hangs" is not.
+// Fail-open by design everywhere: any error (no config pushed yet, unknown
+// user/tag) results in NO limiting, never a blocked or dropped connection.
+// This is a bandwidth cap, not an access control — the failure mode of "no
+// limit" is always safe; the failure mode of "connection hangs" is not.
+//
+// Config delivery: PUSHED, not polled. Marzban-node's own process (node.py)
+// runs a plain HTTP listener on 127.0.0.1 (see LocalServerAddr) that
+// receives a POST whenever an admin changes a limit in the panel, AND right
+// after every xray-core start/restart (node.py re-sends whatever it last
+// had, since a restarted xray-core's in-memory cfg here is empty) — so
+// there's never a polling loop or a stored credential on this side at all;
+// this package only ever WRITES to on incoming request, never dials out.
 package speedlimit
 
 import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/errors"
 	"sync"
 	"time"
 
@@ -35,15 +43,18 @@ import (
 )
 
 const (
-	refreshInterval = 60 * time.Second
-	idleTTL         = 5 * time.Minute
-	fetchTimeout    = 10 * time.Second
+	idleTTL = 5 * time.Minute
+	// LocalServerAddr — 127.0.0.1-only by construction (net.Listen below),
+	// nothing outside this host can ever reach it, hence no auth needed.
+	LocalServerAddr = "127.0.0.1:62053"
 )
 
+// hasConfig flips true on the first successfully received push — Enabled()
+// (and therefore WaitN/LimitWriter) stays a no-op until then, same
+// fail-open intent the old env-gated "enabled" flag had.
 var (
-	configURL = os.Getenv("SPEED_LIMIT_CONFIG_URL")
-	authToken = os.Getenv("SPEED_LIMIT_TOKEN")
-	enabled   = configURL != "" && authToken != ""
+	hasConfig   bool
+	hasConfigMu sync.RWMutex
 )
 
 // ── remote config shape (mirrors GET /api/speed-limits-config) ─────────────
@@ -80,40 +91,43 @@ var (
 	cfg   remoteConfig
 )
 
-func fetchLoop() {
-	fetchOnce()
-	for range time.Tick(refreshInterval) {
-		fetchOnce()
-	}
-}
-
-func fetchOnce() {
-	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, configURL, nil)
+// startLocalServer listens on 127.0.0.1 only (net.Listen with that literal
+// address — never 0.0.0.0) for node.py's pushes. Runs for the lifetime of
+// the process; failure to bind (e.g. another xray-core instance already
+// holding the port during a restart race) is logged and left to retry — a
+// missing push endpoint just means limits stay at whatever they were, the
+// same fail-open posture as everywhere else here.
+func startLocalServer() {
+	ln, err := net.Listen("tcp", LocalServerAddr)
 	if err != nil {
+		errors.LogWarning(context.Background(), "speedlimit: failed to bind local push listener on ", LocalServerAddr, ": ", err)
 		return
 	}
-	req.Header.Set("Authorization", "Bearer "+authToken)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return // keep serving the last-known-good config
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-	var next remoteConfig
-	if err := json.Unmarshal(body, &next); err != nil {
-		return
-	}
-	cfgMu.Lock()
-	cfg = next
-	cfgMu.Unlock()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/speed-limits", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var next remoteConfig
+		if err := json.Unmarshal(body, &next); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		cfgMu.Lock()
+		cfg = next
+		cfgMu.Unlock()
+		hasConfigMu.Lock()
+		hasConfig = true
+		hasConfigMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+	go http.Serve(ln, mux) //nolint:errcheck
 }
 
 func mbpsToBytesPerSec(mbps float64) float64 {
@@ -234,10 +248,7 @@ func key(username, tag, dir string) string {
 }
 
 func init() {
-	if !enabled {
-		return
-	}
-	go fetchLoop()
+	startLocalServer()
 	go idleSweeper()
 }
 
@@ -283,11 +294,11 @@ func getLimiter(username, tag, dir string, bytesPerSec float64) *rate.Limiter {
 
 // WaitN blocks until n bytes' worth of tokens are available for
 // username+tag+direction, or returns immediately if no limit applies
-// (unlimited, config not loaded yet, or the package is disabled because
-// SPEED_LIMIT_CONFIG_URL/SPEED_LIMIT_TOKEN aren't set). Direction: true for
-// upload (client->outbound), false for download (outbound->client).
+// (unlimited, or no config has ever been pushed to this node yet).
+// Direction: true for upload (client->outbound), false for download
+// (outbound->client).
 func WaitN(ctx context.Context, username, tag string, up bool, n int) error {
-	if !enabled || username == "" || n <= 0 {
+	if !Enabled() || username == "" || n <= 0 {
 		return nil
 	}
 	bps := effectiveLimitBytesPerSec(username, tag, up)
@@ -340,16 +351,20 @@ func (w *limitedWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 // username+tag+direction cap, if any (see WaitN). email is xray's raw
 // inbound.User.Email ("{id}.{username}[#tag]") — normalized internally.
 func LimitWriter(ctx context.Context, w buf.Writer, email, tag string, up bool) buf.Writer {
-	if !enabled || email == "" {
+	if !Enabled() || email == "" {
 		return w
 	}
 	return &limitedWriter{Writer: w, ctx: ctx, username: Username(email), tag: tag, up: up}
 }
 
-// Enabled reports whether SPEED_LIMIT_CONFIG_URL/SPEED_LIMIT_TOKEN are set —
-// i.e. whether this package does anything at all on this node.
+// Enabled reports whether this node has ever received a speed-limits push
+// from node.py yet — i.e. whether this package does anything at all right
+// now. False right after a fresh xray-core start, until node.py's
+// post-start push (or the next admin-triggered push) lands.
 func Enabled() bool {
-	return enabled
+	hasConfigMu.RLock()
+	defer hasConfigMu.RUnlock()
+	return hasConfig
 }
 
 // Username normalizes xray's inbound.User.Email ("{id}.{username}" or
