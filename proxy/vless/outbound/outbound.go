@@ -24,6 +24,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/retry"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/speedlimit"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/xudp"
@@ -152,6 +153,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return errors.New("target not specified").AtError()
 	}
 	ob.Name = "vless"
+	// Marzban patch: per-user speed cap, see common/speedlimit. Needed here
+	// (not just proxy/freedom) because a bridge/relay hop (main node ->
+	// bridge node -> final node) chains a VLESS OUTBOUND on the entry node
+	// before ever reaching a "freedom" outbound on the final node — for
+	// that first hop, THIS is the actual byte-copy loop for the client's
+	// traffic, freedom.go's patch never runs on the entry node at all.
+	speedlimitInbound := session.InboundFromContext(ctx)
 
 	rec := h.server
 	var conn stat.Connection
@@ -364,7 +372,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				}
 			}
 		}
-		err := buf.Copy(clientReader, serverWriter, buf.UpdateActivity(timer))
+		limitedServerWriter := serverWriter
+		if speedlimitInbound != nil && speedlimitInbound.User != nil {
+			limitedServerWriter = speedlimit.LimitWriter(ctx, serverWriter, speedlimitInbound.User.Email, speedlimitInbound.Tag, true)
+		}
+		err := buf.Copy(clientReader, limitedServerWriter, buf.UpdateActivity(timer))
 		if err != nil {
 			return errors.New("failed to transfer request payload").Base(err).AtInfo()
 		}
@@ -398,10 +410,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		if requestAddons.Flow == vless.XRV {
+			// Marzban: XTLS Vision's splice-like fast path isn't wrapped —
+			// those inbounds (raw TCP+REALITY) already work fine via the
+			// external tc shaper (no short-lived-connection problem there).
 			err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx)
 		} else {
+			limitedClientWriter := clientWriter
+			if speedlimitInbound != nil && speedlimitInbound.User != nil {
+				limitedClientWriter = speedlimit.LimitWriter(ctx, clientWriter, speedlimitInbound.User.Email, speedlimitInbound.Tag, false)
+			}
 			// from serverReader.ReadMultiBuffer to clientWriter.WriteMultiBuffer
-			err = buf.Copy(serverReader, clientWriter, buf.UpdateActivity(timer))
+			err = buf.Copy(serverReader, limitedClientWriter, buf.UpdateActivity(timer))
 		}
 
 		if err != nil {
