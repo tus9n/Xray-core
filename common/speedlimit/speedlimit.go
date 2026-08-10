@@ -350,8 +350,18 @@ func (w *limitedWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 // LimitWriter wraps w so every write is throttled to the effective
 // username+tag+direction cap, if any (see WaitN). email is xray's raw
 // inbound.User.Email ("{id}.{username}[#tag]") — normalized internally.
+//
+// Deliberately does NOT gate on Enabled() here: unlike the old poll design
+// (where enabled was fixed true from process start, before any traffic
+// flowed), the push design's Enabled() can flip from false to true AFTER a
+// connection is already established — right after a restart, before
+// node.py's post-restart push has landed. Gating the wrap here would freeze
+// that connection unwrapped for its entire (possibly long-lived XHTTP/
+// VLESS) lifetime even once a push arrives. WaitN() already checks
+// Enabled() on every call, so wrapping unconditionally costs one no-op
+// function call per write when disabled — negligible, and always correct.
 func LimitWriter(ctx context.Context, w buf.Writer, email, tag string, up bool) buf.Writer {
-	if !Enabled() || email == "" {
+	if email == "" {
 		return w
 	}
 	return &limitedWriter{Writer: w, ctx: ctx, username: Username(email), tag: tag, up: up}

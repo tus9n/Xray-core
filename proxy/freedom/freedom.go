@@ -33,7 +33,7 @@ import (
 )
 
 var (
-	useSplice               atomic.Bool
+	useSpliceFlag           atomic.Bool
 	allNetworks             [8]bool
 	defaultBlockPrivateRule *FinalRule
 	defaultBlockAllRule     *FinalRule
@@ -47,17 +47,26 @@ func reloadEnvSettings() error {
 	case defaultFlagValue, "auto", "enable":
 		enabled = true
 	}
-	// Marzban patch: splice() is a kernel-level zero-copy path that never
-	// goes through buf.Copy — our per-user speedlimit.WaitN wrapping around
-	// buf.Copy below would be silently bypassed for any connection eligible
-	// for it. Correctness (the cap never being skipped) matters more than
-	// the splice performance win here, so disable it outright whenever the
-	// limiter is active (SPEED_LIMIT_CONFIG_URL/TOKEN set).
-	if speedlimit.Enabled() {
-		enabled = false
-	}
-	useSplice.Store(enabled)
+	// Marzban patch: whether to actually disable splice for the limiter's
+	// sake is decided live at connect time (see useSplice() below), NOT
+	// baked in here — reloadEnvSettings only runs once at process startup
+	// (platform.RegisterEnvReload), before speedlimit.Enabled() could ever
+	// possibly be true yet (a push can't land before the process has even
+	// finished starting). Caching that one-time false here would disable
+	// the limiter's splice guard for the rest of the process's life.
+	useSpliceFlag.Store(enabled)
 	return nil
+}
+
+// useSplice reports whether splice() may be used for this connection.
+// Marzban patch: splice() is a kernel-level zero-copy path that never goes
+// through buf.Copy — our per-user speedlimit.WaitN wrapping around buf.Copy
+// below would be silently bypassed for any connection eligible for it.
+// Correctness (the cap never being skipped) matters more than the splice
+// performance win, so this is re-checked live on every connection rather
+// than cached once at startup — see reloadEnvSettings above for why.
+func useSplice() bool {
+	return useSpliceFlag.Load() && !speedlimit.Enabled()
 }
 
 func init() {
@@ -447,7 +456,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	responseDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-		if destination.Network == net.Network_TCP && useSplice.Load() && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
+		if destination.Network == net.Network_TCP && useSplice() && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
 			var writeConn net.Conn
 			var inTimer *signal.ActivityTimer
 			if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
