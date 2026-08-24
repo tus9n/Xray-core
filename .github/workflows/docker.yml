@@ -1,11 +1,9 @@
 name: Build and Push Docker Image
 
 on:
-  release:
-    types:
-      - published
-      - released
-
+  # Marzban patch: this fork only ships Xray-linux-64.zip via install.sh —
+  # nothing pulls a Docker image of Xray itself, so no need to build/push
+  # one on every release. Still runnable by hand if ever needed.
   workflow_dispatch:
     inputs:
       tag:

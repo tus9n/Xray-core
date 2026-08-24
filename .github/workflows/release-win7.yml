@@ -1,12 +1,10 @@
 name: Build and Release for Windows 7
 
 on:
+  # Marzban patch: this fork only ships Xray-linux-64.zip (see release.yml) —
+  # Windows 7 isn't a supported target for Marzban nodes, no need to build/
+  # upload it on every release. Still runnable by hand if ever needed.
   workflow_dispatch:
-  release:
-    types: [published]
-  push:
-  pull_request:
-    types: [opened, synchronize, reopened]
 
 jobs:
   check-assets:
