@@ -339,11 +339,26 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		if request.Command == protocol.RequestCommandMux && request.Port == 666 {
 			serverWriter = xudp.NewPacketWriter(serverWriter, target, xudp.GetGlobalID(ctx))
 		}
+		// Marzban patch: construct the rate-limited writer BEFORE the
+		// early-payload write below, not after it. Upstream wrote the first
+		// up-to-500ms chunk (VLESS-header camouflage timing) straight to the
+		// raw serverWriter, bypassing speedlimit entirely — harmless for a
+		// single connection, but every new stream on a relay hop gets its
+		// own free unlimited half-second burst, and a multi-connection
+		// client (e.g. a speed-test app opening several parallel uploads)
+		// can rack up a large aggregate overshoot from this alone. Confirmed
+		// live: nPerf app upload measured ~17x the configured per-user cap
+		// through a bridge relay inbound, while a single-connection browser
+		// upload stayed within the cap on the same inbound/limit.
+		limitedServerWriter := serverWriter
+		if speedlimitInbound != nil && speedlimitInbound.User != nil {
+			limitedServerWriter = speedlimit.LimitWriter(ctx, serverWriter, speedlimitInbound.User.Email, speedlimitInbound.Tag, true)
+		}
 		timeoutReader, ok := clientReader.(buf.TimeoutReader)
 		if ok {
 			multiBuffer, err1 := timeoutReader.ReadMultiBufferTimeout(time.Millisecond * 500)
 			if err1 == nil {
-				if err := serverWriter.WriteMultiBuffer(multiBuffer); err != nil {
+				if err := limitedServerWriter.WriteMultiBuffer(multiBuffer); err != nil {
 					return err // ...
 				}
 			} else if err1 != buf.ErrReadTimeout {
@@ -351,7 +366,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			} else if requestAddons.Flow == vless.XRV {
 				mb := make(buf.MultiBuffer, 1)
 				errors.LogInfo(ctx, "Insert padding with empty content to camouflage VLESS header ", mb.Len())
-				if err := serverWriter.WriteMultiBuffer(mb); err != nil {
+				if err := limitedServerWriter.WriteMultiBuffer(mb); err != nil {
 					return err // ...
 				}
 			}
@@ -373,10 +388,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					return errors.New(`failed to use `+requestAddons.Flow+`, found outer tls version `, utlsConn.ConnectionState().Version).AtWarning()
 				}
 			}
-		}
-		limitedServerWriter := serverWriter
-		if speedlimitInbound != nil && speedlimitInbound.User != nil {
-			limitedServerWriter = speedlimit.LimitWriter(ctx, serverWriter, speedlimitInbound.User.Email, speedlimitInbound.Tag, true)
 		}
 		err := buf.Copy(clientReader, limitedServerWriter, buf.UpdateActivity(timer))
 		if err != nil {
