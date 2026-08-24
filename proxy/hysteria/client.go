@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/signal"
+	"github.com/xtls/xray-core/common/speedlimit"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
@@ -51,6 +52,14 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 }
 
 func (c *Client) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
+	// Marzban patch: per-user speed cap, see common/speedlimit. Unlike
+	// proxy/freedom and proxy/vless/outbound, this relay hop (hysteria2 ->
+	// hysteria2, used for bridge/final-node hysteria2 relays — see
+	// app/xray/config.py's _relay_ob) never had any speedlimit wiring at
+	// all: neither direction went through LimitWriter, so a per-user/
+	// per-inbound limit configured on a hysteria2 bridge inbound was
+	// silently unenforced on the relay leg.
+	speedlimitInbound := session.InboundFromContext(ctx)
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 	if !ob.Target.IsValid() {
@@ -97,7 +106,11 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			if err := bufferedWriter.SetBuffered(false); err != nil {
 				return err
 			}
-			return buf.Copy(link.Reader, bufferedWriter, buf.UpdateActivity(timer))
+			var reqWriter buf.Writer = bufferedWriter
+			if speedlimitInbound != nil && speedlimitInbound.User != nil {
+				reqWriter = speedlimit.LimitWriter(ctx, reqWriter, speedlimitInbound.User.Email, speedlimitInbound.Tag, true)
+			}
+			return buf.Copy(link.Reader, reqWriter, buf.UpdateActivity(timer))
 		}
 
 		responseDone := func() error {
@@ -109,7 +122,11 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 			if !ok {
 				return errors.New(msg)
 			}
-			return buf.Copy(buf.NewReader(conn), link.Writer, buf.UpdateActivity(timer))
+			var respWriter buf.Writer = link.Writer
+			if speedlimitInbound != nil && speedlimitInbound.User != nil {
+				respWriter = speedlimit.LimitWriter(ctx, respWriter, speedlimitInbound.User.Email, speedlimitInbound.Tag, false)
+			}
+			return buf.Copy(buf.NewReader(conn), respWriter, buf.UpdateActivity(timer))
 		}
 
 		responseDoneAndCloseWriter := task.OnSuccess(responseDone, task.Close(link.Writer))
@@ -130,9 +147,12 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		requestDone := func() error {
 			defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
 
-			writer := &UDPWriter{
+			var writer buf.Writer = &UDPWriter{
 				writer: conn,
 				addr:   target.NetAddr(),
+			}
+			if speedlimitInbound != nil && speedlimitInbound.User != nil {
+				writer = speedlimit.LimitWriter(ctx, writer, speedlimitInbound.User.Email, speedlimitInbound.Tag, true)
 			}
 
 			if err := buf.Copy(link.Reader, writer, buf.UpdateActivity(timer)); err != nil {
@@ -149,8 +169,12 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 				reader: conn,
 				df:     &Defragger{},
 			}
+			var respWriter buf.Writer = link.Writer
+			if speedlimitInbound != nil && speedlimitInbound.User != nil {
+				respWriter = speedlimit.LimitWriter(ctx, respWriter, speedlimitInbound.User.Email, speedlimitInbound.Tag, false)
+			}
 
-			if err := buf.Copy(reader, link.Writer, buf.UpdateActivity(timer)); err != nil {
+			if err := buf.Copy(reader, respWriter, buf.UpdateActivity(timer)); err != nil {
 				return errors.New("failed to transport all UDP response").Base(err)
 			}
 
