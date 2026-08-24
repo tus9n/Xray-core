@@ -93,14 +93,27 @@ var (
 
 // startLocalServer listens on 127.0.0.1 only (net.Listen with that literal
 // address — never 0.0.0.0) for node.py's pushes. Runs for the lifetime of
-// the process; failure to bind (e.g. another xray-core instance already
-// holding the port during a restart race) is logged and left to retry — a
-// missing push endpoint just means limits stay at whatever they were, the
-// same fail-open posture as everywhere else here.
+// the process. Retries the bind for a while before giving up: with
+// network_mode: host on the node side, a container restart briefly races
+// the dying old xray-core process's socket against this one's — losing
+// that race used to be permanent (this function only ever ran once, at
+// startup), silently disabling the limiter for the process's entire
+// lifetime until the next restart happened to win the race instead. A
+// missing push endpoint after retries are exhausted just means limits
+// stay at whatever they were, the same fail-open posture as everywhere
+// else here.
 func startLocalServer() {
-	ln, err := net.Listen("tcp", LocalServerAddr)
+	var ln net.Listener
+	var err error
+	for attempt := 0; attempt < 15; attempt++ {
+		ln, err = net.Listen("tcp", LocalServerAddr)
+		if err == nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
 	if err != nil {
-		errors.LogWarning(context.Background(), "speedlimit: failed to bind local push listener on ", LocalServerAddr, ": ", err)
+		errors.LogWarning(context.Background(), "speedlimit: failed to bind local push listener on ", LocalServerAddr, " after retries: ", err)
 		return
 	}
 	mux := http.NewServeMux()
