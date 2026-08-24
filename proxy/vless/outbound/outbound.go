@@ -409,10 +409,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
-		if requestAddons.Flow == vless.XRV {
-			// Marzban: XTLS Vision's splice-like fast path isn't wrapped —
-			// those inbounds (raw TCP+REALITY) already work fine via the
-			// external tc shaper (no short-lived-connection problem there).
+		if requestAddons.Flow == vless.XRV && !speedlimit.Enabled() {
+			// Marzban: XTLS Vision's splice-like fast path never goes through
+			// speedlimit.LimitWriter (it writes straight to clientWriter), so
+			// it's only safe to take while no per-user/per-inbound limit is
+			// configured on this node at all. The external tc shaper this
+			// used to lean on for raw TCP+REALITY inbounds was removed from
+			// Marzban-node in favor of this push-based limiter — there is no
+			// other enforcement left for this path once limits are enabled.
 			err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx)
 		} else {
 			limitedClientWriter := clientWriter
