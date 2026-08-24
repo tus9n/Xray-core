@@ -32,6 +32,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -261,6 +262,27 @@ func key(username, tag, dir string) string {
 }
 
 func init() {
+	// Go runs every imported package's init() unconditionally at process
+	// start, before main() ever looks at os.Args — so a bare `xray version`
+	// or `xray -test` (e.g. the node install/update script's own "Installed:
+	// $(xray-real version)" banner) triggered this same bind attempt as a
+	// real `xray run`, and predictably failed with "address already in use"
+	// against the actually-running instance's listener. Harmless (this
+	// process exits right after printing the version anyway) but confusing
+	// log noise, and needless work — only start the listener for `run`.
+	isRun := false
+	for _, a := range os.Args[1:] {
+		if a == "run" {
+			isRun = true
+			break
+		}
+		if len(a) > 0 && a[0] != '-' {
+			break // first non-flag arg is the subcommand; anything but "run" means don't bind
+		}
+	}
+	if !isRun {
+		return
+	}
 	startLocalServer()
 	go idleSweeper()
 }
