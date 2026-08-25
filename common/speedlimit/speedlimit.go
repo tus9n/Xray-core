@@ -74,6 +74,14 @@ type inboundLimits struct {
 type userLimits struct {
 	DownMbps *float64 `json:"down_mbps"`
 	UpMbps   *float64 `json:"up_mbps"`
+	// Scope: "total" — DownMbps/UpMbps (and, if unset here, Default) is one
+	// bucket shared across every inbound tag this user is active on, on this
+	// node. "per_inbound" (or unset) — the current/original behaviour: each
+	// tag gets its own independent bucket, so N simultaneous inbounds give
+	// the user up to N× the nominal cap in aggregate. Never applies to
+	// Inbounds[tag]/UserInboundOverrides — those stay per-tag by definition
+	// regardless of Scope, see effectiveScope/localLimitBytesPerSec.
+	Scope *string `json:"scope"`
 }
 
 type remoteConfig struct {
@@ -81,10 +89,13 @@ type remoteConfig struct {
 		DownMbps *float64 `json:"down_mbps"`
 		UpMbps   *float64 `json:"up_mbps"`
 	} `json:"default"`
-	Node                 *nodeLimits                         `json:"node"`
-	Inbounds             map[string]inboundLimits             `json:"inbounds"`
-	Users                map[string]userLimits                `json:"users"`
-	UserInboundOverrides map[string]map[string]userLimits     `json:"user_inbound_overrides"`
+	// DefaultScope — fallback Scope (see userLimits.Scope) for any user that
+	// doesn't set its own; "" behaves as "per_inbound".
+	DefaultScope         string                            `json:"default_scope"`
+	Node                 *nodeLimits                       `json:"node"`
+	Inbounds             map[string]inboundLimits          `json:"inbounds"`
+	Users                map[string]userLimits             `json:"users"`
+	UserInboundOverrides map[string]map[string]userLimits `json:"user_inbound_overrides"`
 }
 
 var (
@@ -161,16 +172,45 @@ func minPositive(vals ...*float64) *float64 {
 	return best
 }
 
-// effectiveLimitBytesPerSec mirrors app/jobs/... speed_shaper.py's
-// _effective_limit(): min() of every applicable down/up limit (node /
-// inbound / user / user-on-this-inbound), falling back to the global
-// default only when NEITHER the user nor the user-inbound override
-// explicitly set 0 (0 there means "explicitly unlimited", not "unset").
-func effectiveLimitBytesPerSec(username, tag string, up bool) *float64 {
+// effectiveScope reports whether username's default/user-tier cap should be
+// one bucket shared across every inbound tag ("total") rather than the
+// original independent-bucket-per-tag behaviour. Per-user Scope wins over
+// DefaultScope; both empty/unset means "per_inbound" (unchanged behaviour).
+func effectiveScope(username string) bool {
+	cfgMu.RLock()
+	defer cfgMu.RUnlock()
+	if u, ok := cfg.Users[username]; ok && u.Scope != nil && *u.Scope != "" {
+		return *u.Scope == "total"
+	}
+	return cfg.DefaultScope == "total"
+}
+
+// localLimitBytesPerSec is the min() of every applicable tag-scoped cap —
+// node and this specific inbound/user-inbound-override — deliberately
+// EXCLUDING the user/default tier (see userDefaultLimitBytesPerSec). Always
+// enforced per (username, tag, direction), regardless of Scope: an explicit
+// per-inbound number always stays independent of what other inbounds the
+// user has open, by design (see userLimits.Scope doc and the admin UI's own
+// "Лимит на конкретном инбаунде" tooltip).
+// explicitUnlimited reports whether this user has an explicit 0 override
+// for this exact tag — "unlimited on this inbound", which must suppress the
+// user/default fallback too (matches the pre-Scope original behaviour).
+func explicitUnlimitedOverride(username, tag string, up bool) bool {
+	cfgMu.RLock()
+	defer cfgMu.RUnlock()
+	if overrides, ok := cfg.UserInboundOverrides[username]; ok {
+		if ui, ok := overrides[tag]; ok {
+			return zeroOrNil(ui, up)
+		}
+	}
+	return false
+}
+
+func localLimitBytesPerSec(username, tag string, up bool) *float64 {
 	cfgMu.RLock()
 	defer cfgMu.RUnlock()
 
-	var node, inbound, user, userInbound *float64
+	var node, inbound, userInbound *float64
 	if cfg.Node != nil {
 		if up {
 			node = minPositive(cfg.Node.UpMbps, cfg.Node.PerUserUpMbps)
@@ -185,18 +225,8 @@ func effectiveLimitBytesPerSec(username, tag string, up bool) *float64 {
 			inbound = ib.DownMbps
 		}
 	}
-	u, userSet := cfg.Users[username]
-	if userSet {
-		if up {
-			user = u.UpMbps
-		} else {
-			user = u.DownMbps
-		}
-	}
-	var userInboundSet bool
 	if overrides, ok := cfg.UserInboundOverrides[username]; ok {
 		if ui, ok := overrides[tag]; ok {
-			userInboundSet = true
 			if up {
 				userInbound = ui.UpMbps
 			} else {
@@ -205,14 +235,35 @@ func effectiveLimitBytesPerSec(username, tag string, up bool) *float64 {
 		}
 	}
 
-	limitMbps := minPositive(node, inbound, user, userInbound)
+	limitMbps := minPositive(node, inbound, userInbound)
+	if limitMbps == nil || *limitMbps <= 0 {
+		return nil
+	}
+	bps := mbpsToBytesPerSec(*limitMbps)
+	return &bps
+}
+
+// userDefaultLimitBytesPerSec is username's own cap, falling back to the
+// global default unless username (or its per-inbound override, checked by
+// the caller separately) explicitly set 0 ("unlimited", not "unset").
+// Ignores tag entirely — same number regardless of which inbound asks.
+func userDefaultLimitBytesPerSec(username string, up bool) *float64 {
+	cfgMu.RLock()
+	defer cfgMu.RUnlock()
+
+	u, userSet := cfg.Users[username]
+	var user *float64
+	if userSet {
+		if up {
+			user = u.UpMbps
+		} else {
+			user = u.DownMbps
+		}
+	}
+	limitMbps := user
 	if limitMbps == nil {
-		// Nothing explicitly set at any level — explicit 0 at user/
-		// user-inbound level means "unlimited", not "fall through to
-		// default" (matches speed_shaper.py's _effective_limit).
-		explicitZero := (userSet && zeroOrNil(u, up)) || (userInboundSet && zeroOrNilOverride(cfg.UserInboundOverrides[username][tag], up))
-		if explicitZero {
-			return nil
+		if userSet && zeroOrNil(u, up) {
+			return nil // explicit 0 at user level means unlimited
 		}
 		var def *float64
 		if up {
@@ -229,16 +280,31 @@ func effectiveLimitBytesPerSec(username, tag string, up bool) *float64 {
 	return &bps
 }
 
+// effectiveLimitBytesPerSec is the original (pre-Scope) combined cap: min()
+// of node/inbound/user/user-inbound-override, default as fallback. Used
+// as-is for the "per_inbound" (default) scope, where everything shares one
+// per-tag bucket exactly like before Scope existed.
+func effectiveLimitBytesPerSec(username, tag string, up bool) *float64 {
+	local := localLimitBytesPerSec(username, tag, up)
+	if explicitUnlimitedOverride(username, tag, up) {
+		// Explicit 0 on this exact inbound overrides the user/default tier
+		// too, same as before Scope existed — a bare 0 (no other number set
+		// on this override) already made local nil, so this only matters
+		// when it's the SOLE thing set (nothing to combine with anyway).
+		return local
+	}
+	// minPositive skips nils, so this is correct whether userDefault is nil
+	// because nothing applies or because of an explicit unlimited-0 at user
+	// level (userDefaultLimitBytesPerSec already resolves that distinction).
+	return minPositive(local, userDefaultLimitBytesPerSec(username, up))
+}
+
 func zeroOrNil(u userLimits, up bool) bool {
 	v := u.DownMbps
 	if up {
 		v = u.UpMbps
 	}
 	return v != nil && *v == 0
-}
-
-func zeroOrNilOverride(u userLimits, up bool) bool {
-	return zeroOrNil(u, up)
 }
 
 // ── shared limiter registry, keyed by (username, tag, direction) ───────────
@@ -300,8 +366,13 @@ func idleSweeper() {
 	}
 }
 
-func getLimiter(username, tag, dir string, bytesPerSec float64) *rate.Limiter {
-	k := key(username, tag, dir)
+// globalTag is the key()'s tag component for the "total" scope's
+// shared-across-all-inbounds bucket — never a legal xray inbound tag
+// (those come from config, always non-empty), so it can't collide with any
+// real per-tag bucket.
+const globalTag = ""
+
+func getLimiter(k string, bytesPerSec float64) *rate.Limiter {
 	regMu.Lock()
 	defer regMu.Unlock()
 	e, ok := reg[k]
@@ -327,29 +398,13 @@ func getLimiter(username, tag, dir string, bytesPerSec float64) *rate.Limiter {
 	return e.limiter
 }
 
-// WaitN blocks until n bytes' worth of tokens are available for
-// username+tag+direction, or returns immediately if no limit applies
-// (unlimited, or no config has ever been pushed to this node yet).
-// Direction: true for upload (client->outbound), false for download
-// (outbound->client).
-func WaitN(ctx context.Context, username, tag string, up bool, n int) error {
-	if !Enabled() || username == "" || n <= 0 {
-		return nil
-	}
-	bps := effectiveLimitBytesPerSec(username, tag, up)
-	if bps == nil {
-		return nil
-	}
-	dir := "down"
-	if up {
-		dir = "up"
-	}
-	limiter := getLimiter(username, tag, dir, *bps)
-	// rate.Limiter caps WaitN's n at its own burst size — a single chunk
-	// larger than the burst would otherwise always error out instead of
-	// just taking longer to drain. buf.Buffer chunks are bounded (2000-ish
-	// bytes) in practice, well under any realistic burst, but split
-	// defensively anyway rather than assume that never changes upstream.
+// drainLimiter blocks until n bytes' worth of tokens are available from
+// limiter. rate.Limiter caps WaitN's n at its own burst size — a single
+// chunk larger than the burst would otherwise always error out instead of
+// just taking longer to drain. buf.Buffer chunks are bounded (2000-ish
+// bytes) in practice, well under any realistic burst, but split defensively
+// anyway rather than assume that never changes upstream.
+func drainLimiter(ctx context.Context, limiter *rate.Limiter, n int) {
 	burst := limiter.Burst()
 	for n > 0 {
 		take := n
@@ -357,9 +412,47 @@ func WaitN(ctx context.Context, username, tag string, up bool, n int) error {
 			take = burst
 		}
 		if err := limiter.WaitN(ctx, take); err != nil {
-			return nil // fail-open: context cancelled or similar — never block the proxy on our own account
+			return // fail-open: context cancelled or similar — never block the proxy on our own account
 		}
 		n -= take
+	}
+}
+
+// WaitN blocks until n bytes' worth of tokens are available for
+// username+tag+direction, or returns immediately if no limit applies
+// (unlimited, or no config has ever been pushed to this node yet).
+// Direction: true for upload (client->outbound), false for download
+// (outbound->client).
+//
+// Under Scope=="total" (see effectiveScope), the user/default tier is
+// enforced through a SECOND bucket shared across every tag that user is
+// active on — layered on top of (not instead of) the tag-scoped bucket
+// that still enforces node/inbound/user-inbound-override caps. Both are
+// drained independently, so actual throughput is capped by whichever is
+// more restrictive at any given moment.
+func WaitN(ctx context.Context, username, tag string, up bool, n int) error {
+	if !Enabled() || username == "" || n <= 0 {
+		return nil
+	}
+	dir := "down"
+	if up {
+		dir = "up"
+	}
+
+	if effectiveScope(username) {
+		if bps := localLimitBytesPerSec(username, tag, up); bps != nil {
+			drainLimiter(ctx, getLimiter(key(username, tag, dir), *bps), n)
+		}
+		if !explicitUnlimitedOverride(username, tag, up) {
+			if bps := userDefaultLimitBytesPerSec(username, up); bps != nil {
+				drainLimiter(ctx, getLimiter(key(username, globalTag, dir), *bps), n)
+			}
+		}
+		return nil
+	}
+
+	if bps := effectiveLimitBytesPerSec(username, tag, up); bps != nil {
+		drainLimiter(ctx, getLimiter(key(username, tag, dir), *bps), n)
 	}
 	return nil
 }
