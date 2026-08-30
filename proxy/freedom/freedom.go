@@ -22,6 +22,7 @@ import (
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/speedlimit"
 	"github.com/xtls/xray-core/common/task"
+	"github.com/xtls/xray-core/common/torrentguard"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
@@ -283,6 +284,24 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		defaultRule = getDefaultFinalRule(inbound)
 	}
 
+	// Marzban patch: torrentguard fan-out/symmetry guard, see
+	// common/torrentguard. Computed once here (used both for the drop-at-dial
+	// check below and for RecordOpen/TrackWriter/EnforceWriter further down).
+	var tgUsername, tgSourceIP string
+	if inbound != nil && inbound.User != nil {
+		tgUsername = speedlimit.Username(inbound.User.Email)
+	}
+	if inbound != nil && inbound.Source.IsValid() {
+		tgSourceIP = inbound.Source.Address.String()
+	}
+	if torrentguard.ShouldDrop(tgUsername, tgSourceIP) {
+		errors.LogInfo(ctx, "torrentguard: refusing new connection for user ", tgUsername, " src ", tgSourceIP, " (enforced)")
+		if err := buf.Copy(link.Reader, buf.Discard); err != nil {
+			return nil
+		}
+		return nil
+	}
+
 	destination := ob.Target
 	origTargetAddr := ob.OriginalTarget.Address
 	if origTargetAddr == nil {
@@ -391,6 +410,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	defer conn.Close()
 	errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
+	// Marzban patch: register this connection with torrentguard using the
+	// actually-dialed remote IP (not `destination`, which can still be an
+	// unresolved domain) — see common/torrentguard.
+	tgDestIP := net.DestinationFromAddr(conn.RemoteAddr()).Address.String()
+	tgHandle := torrentguard.RecordOpen(ctx, tgUsername, tgSourceIP, tgDestIP)
+
 	var newCtx context.Context
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
@@ -435,6 +460,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
+		// Marzban patch: torrentguard fan-out/symmetry tracking + enforcement,
+		// see common/torrentguard. No-op wrapping when tgHandle is nil.
+		writer = torrentguard.TrackWriter(writer, tgHandle, true)
+		writer = torrentguard.EnforceWriter(ctx, writer, tgHandle, true)
+
 		// Marzban patch: per-user upload cap, see common/speedlimit. `up:
 		// true` — this is the client->destination direction (input is
 		// link.Reader, i.e. what the inbound decoded from the client).
@@ -466,11 +496,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		} else {
 			reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
 		}
+		// Marzban patch: torrentguard fan-out/symmetry tracking + enforcement,
+		// mirrors requestDone above. `up: false` — destination->client.
+		limitedOutput := output
+		limitedOutput = torrentguard.TrackWriter(limitedOutput, tgHandle, false)
+		limitedOutput = torrentguard.EnforceWriter(ctx, limitedOutput, tgHandle, false)
+
 		// Marzban patch: per-user download cap, mirrors requestDone above.
 		// `up: false` — destination->client direction.
-		limitedOutput := output
 		if inbound != nil && inbound.User != nil {
-			limitedOutput = speedlimit.LimitWriter(ctx, output, inbound.User.Email, inbound.Tag, false)
+			limitedOutput = speedlimit.LimitWriter(ctx, limitedOutput, inbound.User.Email, inbound.Tag, false)
 		}
 		if err := buf.Copy(reader, limitedOutput, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to process response").Base(err)
