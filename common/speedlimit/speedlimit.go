@@ -30,25 +30,23 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"net"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/localpush"
 	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
 )
 
-const (
-	idleTTL = 5 * time.Minute
-	// LocalServerAddr — 127.0.0.1-only by construction (net.Listen below),
-	// nothing outside this host can ever reach it, hence no auth needed.
-	LocalServerAddr = "127.0.0.1:62053"
-)
+const idleTTL = 5 * time.Minute
+
+// LocalServerAddr — kept for anything still referencing it — is just an
+// alias to the shared listener's address; see common/localpush for the
+// actual bind/retry/run-gating logic (now shared with common/torrentguard).
+const LocalServerAddr = localpush.Addr
 
 // hasConfig flips true on the first successfully received push — Enabled()
 // (and therefore WaitN/LimitWriter) stays a no-op until then, same
@@ -60,8 +58,8 @@ var (
 
 // ── remote config shape (mirrors GET /api/speed-limits-config) ─────────────
 type nodeLimits struct {
-	DownMbps       *float64 `json:"down_mbps"`
-	UpMbps         *float64 `json:"up_mbps"`
+	DownMbps        *float64 `json:"down_mbps"`
+	UpMbps          *float64 `json:"up_mbps"`
 	PerUserDownMbps *float64 `json:"per_user_down_mbps"`
 	PerUserUpMbps   *float64 `json:"per_user_up_mbps"`
 }
@@ -91,10 +89,10 @@ type remoteConfig struct {
 	} `json:"default"`
 	// DefaultScope — fallback Scope (see userLimits.Scope) for any user that
 	// doesn't set its own; "" behaves as "per_inbound".
-	DefaultScope         string                            `json:"default_scope"`
-	Node                 *nodeLimits                       `json:"node"`
-	Inbounds             map[string]inboundLimits          `json:"inbounds"`
-	Users                map[string]userLimits             `json:"users"`
+	DefaultScope         string                           `json:"default_scope"`
+	Node                 *nodeLimits                      `json:"node"`
+	Inbounds             map[string]inboundLimits         `json:"inbounds"`
+	Users                map[string]userLimits            `json:"users"`
 	UserInboundOverrides map[string]map[string]userLimits `json:"user_inbound_overrides"`
 }
 
@@ -103,56 +101,32 @@ var (
 	cfg   remoteConfig
 )
 
-// startLocalServer listens on 127.0.0.1 only (net.Listen with that literal
-// address — never 0.0.0.0) for node.py's pushes. Runs for the lifetime of
-// the process. Retries the bind for a while before giving up: with
-// network_mode: host on the node side, a container restart briefly races
-// the dying old xray-core process's socket against this one's — losing
-// that race used to be permanent (this function only ever ran once, at
-// startup), silently disabling the limiter for the process's entire
-// lifetime until the next restart happened to win the race instead. A
-// missing push endpoint after retries are exhausted just means limits
-// stay at whatever they were, the same fail-open posture as everywhere
-// else here.
-func startLocalServer() {
-	var ln net.Listener
-	var err error
-	for attempt := 0; attempt < 15; attempt++ {
-		ln, err = net.Listen("tcp", LocalServerAddr)
-		if err == nil {
-			break
-		}
-		time.Sleep(2 * time.Second)
-	}
-	if err != nil {
-		errors.LogWarning(context.Background(), "speedlimit: failed to bind local push listener on ", LocalServerAddr, " after retries: ", err)
+// handleSpeedLimitsPush is registered on the shared listener (see
+// common/localpush) at "/speed-limits" — node.py POSTs here whenever an
+// admin changes a limit in the panel, and again right after every
+// xray-core start/restart.
+func handleSpeedLimitsPush(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/speed-limits", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		var next remoteConfig
-		if err := json.Unmarshal(body, &next); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		cfgMu.Lock()
-		cfg = next
-		cfgMu.Unlock()
-		hasConfigMu.Lock()
-		hasConfig = true
-		hasConfigMu.Unlock()
-		w.WriteHeader(http.StatusOK)
-	})
-	go http.Serve(ln, mux) //nolint:errcheck
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	var next remoteConfig
+	if err := json.Unmarshal(body, &next); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	cfgMu.Lock()
+	cfg = next
+	cfgMu.Unlock()
+	hasConfigMu.Lock()
+	hasConfig = true
+	hasConfigMu.Unlock()
+	w.WriteHeader(http.StatusOK)
 }
 
 func mbpsToBytesPerSec(mbps float64) float64 {
@@ -328,29 +302,13 @@ func key(username, tag, dir string) string {
 }
 
 func init() {
-	// Go runs every imported package's init() unconditionally at process
-	// start, before main() ever looks at os.Args — so a bare `xray version`
-	// or `xray -test` (e.g. the node install/update script's own "Installed:
-	// $(xray-real version)" banner) triggered this same bind attempt as a
-	// real `xray run`, and predictably failed with "address already in use"
-	// against the actually-running instance's listener. Harmless (this
-	// process exits right after printing the version anyway) but confusing
-	// log noise, and needless work — only start the listener for `run`.
-	isRun := false
-	for _, a := range os.Args[1:] {
-		if a == "run" {
-			isRun = true
-			break
-		}
-		if len(a) > 0 && a[0] != '-' {
-			break // first non-flag arg is the subcommand; anything but "run" means don't bind
-		}
+	localpush.Register("/speed-limits", handleSpeedLimitsPush)
+	// idleSweeper is just in-memory cleanup, but keep it gated the same way
+	// the listener bind is (see localpush.IsRunCommand) — no point ticking
+	// this for a one-shot `xray version`/`xray -test` invocation.
+	if localpush.IsRunCommand() {
+		go idleSweeper()
 	}
-	if !isRun {
-		return
-	}
-	startLocalServer()
-	go idleSweeper()
 }
 
 func idleSweeper() {
