@@ -48,26 +48,17 @@ func reloadEnvSettings() error {
 	case defaultFlagValue, "auto", "enable":
 		enabled = true
 	}
-	// Marzban patch: whether to actually disable splice for the limiter's
-	// sake is decided live at connect time (see useSplice() below), NOT
-	// baked in here — reloadEnvSettings only runs once at process startup
-	// (platform.RegisterEnvReload), before speedlimit.Enabled() could ever
-	// possibly be true yet (a push can't land before the process has even
-	// finished starting). Caching that one-time false here would disable
-	// the limiter's splice guard for the rest of the process's life.
+	// Marzban patch: the environment switch is cached here, while effective
+	// speed-limit and torrent-guard eligibility is decided per connection at
+	// the splice call site.
 	useSpliceFlag.Store(enabled)
 	return nil
 }
 
-// useSplice reports whether splice() may be used for this connection.
-// Marzban patch: splice() is a kernel-level zero-copy path that never goes
-// through buf.Copy — our per-user speedlimit.WaitN wrapping around buf.Copy
-// below would be silently bypassed for any connection eligible for it.
-// Correctness (the cap never being skipped) matters more than the splice
-// performance win, so this is re-checked live on every connection rather
-// than cached once at startup — see reloadEnvSettings above for why.
+// useSplice reports whether the environment allows splice. Per-connection
+// speed-limit and torrent-guard eligibility is checked at the call site.
 func useSplice() bool {
-	return useSpliceFlag.Load() && !speedlimit.Enabled()
+	return useSpliceFlag.Load()
 }
 
 func init() {
@@ -486,14 +477,25 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	responseDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-		if destination.Network == net.Network_TCP && useSplice() && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
+		if destination.Network == net.Network_TCP && useSplice() && tgHandle == nil && inbound != nil && inbound.User != nil && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
 			var writeConn net.Conn
 			var inTimer *signal.ActivityTimer
-			if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+			if inbound.Conn != nil {
 				writeConn = inbound.Conn
 				inTimer = inbound.Timer
 			}
-			return proxy.CopyRawConnIfExist(ctx, conn, writeConn, link.Writer, timer, inTimer)
+			// Splice bypasses both LimitWriter and torrentguard's byte tracking.
+			// tgHandle==nil proves the latter is inactive/exempt; the guard proves
+			// this direction is effectively unlimited under the current speed
+			// config. Any later config push closes conn, forcing a reconnect and
+			// re-evaluation before a new limit can be bypassed.
+			if guard := speedlimit.AllowFastPath(inbound.User.Email, inbound.Tag, false); guard != nil {
+				stop, ok := guard.Activate(func() { _ = conn.Close() })
+				if ok {
+					defer stop()
+					return proxy.CopyRawConnIfExist(ctx, conn, writeConn, link.Writer, timer, inTimer)
+				}
+			}
 		}
 		var reader buf.Reader
 		if destination.Network == net.Network_TCP {
