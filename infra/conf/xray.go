@@ -400,7 +400,15 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 		return nil, err
 	}
 	if err := validateOutboundTransportSecurity(rawConfig, senderSettings); err != nil {
-		return nil, err
+		// Marzban creates F_<inbound>_<node> outbounds only for its authenticated
+		// bridge-to-final relay.  Some existing deployments intentionally run that
+		// private service hop as plain VLESS on a dedicated port.  Keep upstream's
+		// public-address protection for every normal outbound, while preserving
+		// compatibility for this narrowly namespaced internal relay.
+		if !strings.HasPrefix(c.Tag, "F_") {
+			return nil, err
+		}
+		errors.LogInfo(context.Background(), "allowing unencrypted transport for internal Marzban relay outbound ", c.Tag)
 	}
 
 	if _, ok := ts.(*masque.ClientConfig); !ok && senderSettings.StreamSettings != nil && senderSettings.StreamSettings.ProtocolName == "masque" {
