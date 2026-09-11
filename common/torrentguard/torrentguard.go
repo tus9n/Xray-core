@@ -29,13 +29,12 @@ package torrentguard
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"encoding/json"
-	"io"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
