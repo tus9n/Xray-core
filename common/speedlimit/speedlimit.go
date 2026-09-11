@@ -32,11 +32,12 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/localpush"
-	"sync"
-	"time"
 
 	"golang.org/x/time/rate"
 )
@@ -47,14 +48,6 @@ const idleTTL = 5 * time.Minute
 // alias to the shared listener's address; see common/localpush for the
 // actual bind/retry/run-gating logic (now shared with common/torrentguard).
 const LocalServerAddr = localpush.Addr
-
-// hasConfig flips true on the first successfully received push — Enabled()
-// (and therefore WaitN/LimitWriter) stays a no-op until then, same
-// fail-open intent the old env-gated "enabled" flag had.
-var (
-	hasConfig   bool
-	hasConfigMu sync.RWMutex
-)
 
 // ── remote config shape (mirrors GET /api/speed-limits-config) ─────────────
 type nodeLimits struct {
@@ -96,10 +89,29 @@ type remoteConfig struct {
 	UserInboundOverrides map[string]map[string]userLimits `json:"user_inbound_overrides"`
 }
 
+// configState is immutable after publication. Readers on the traffic hot
+// path therefore need one atomic load instead of several independently
+// locked map lookups for every ~2 KiB buffer.
+type configState struct {
+	cfg remoteConfig
+}
+
+var currentConfig atomic.Pointer[configState]
+
+// Fast-path registrations are deliberately separate from the atomic read
+// path. A config push is rare, while every proxied buffer consults the
+// config. Serialising only pushes/registrations lets a push interrupt any
+// already-spliced connection before a newly-added limit could be bypassed.
 var (
-	cfgMu sync.RWMutex
-	cfg   remoteConfig
+	fastPathMu       sync.Mutex
+	fastPathNextID   uint64
+	fastPathWatchers = map[uint64]*fastPathWatcher{}
 )
+
+type fastPathWatcher struct {
+	active    atomic.Bool
+	interrupt func()
+}
 
 // handleSpeedLimitsPush is registered on the shared listener (see
 // common/localpush) at "/speed-limits" — node.py POSTs here whenever an
@@ -120,13 +132,25 @@ func handleSpeedLimitsPush(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	cfgMu.Lock()
-	cfg = next
-	cfgMu.Unlock()
-	hasConfigMu.Lock()
-	hasConfig = true
-	hasConfigMu.Unlock()
+	publishConfig(next)
 	w.WriteHeader(http.StatusOK)
+}
+
+func publishConfig(next remoteConfig) {
+	fastPathMu.Lock()
+	currentConfig.Store(&configState{cfg: next})
+	watchers := fastPathWatchers
+	fastPathWatchers = map[uint64]*fastPathWatcher{}
+	fastPathMu.Unlock()
+
+	// Closing a net.Conn is non-blocking and is intentionally done outside
+	// fastPathMu. It makes long-lived zero-copy connections reconnect and be
+	// re-evaluated against the just-published limits.
+	for _, watcher := range watchers {
+		if watcher.active.Swap(false) {
+			watcher.interrupt()
+		}
+	}
 }
 
 func mbpsToBytesPerSec(mbps float64) float64 {
@@ -150,9 +174,7 @@ func minPositive(vals ...*float64) *float64 {
 // one bucket shared across every inbound tag ("total") rather than the
 // original independent-bucket-per-tag behaviour. Per-user Scope wins over
 // DefaultScope; both empty/unset means "per_inbound" (unchanged behaviour).
-func effectiveScope(username string) bool {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
+func effectiveScope(cfg *remoteConfig, username string) bool {
 	if u, ok := cfg.Users[username]; ok && u.Scope != nil && *u.Scope != "" {
 		return *u.Scope == "total"
 	}
@@ -169,9 +191,7 @@ func effectiveScope(username string) bool {
 // explicitUnlimited reports whether this user has an explicit 0 override
 // for this exact tag — "unlimited on this inbound", which must suppress the
 // user/default fallback too (matches the pre-Scope original behaviour).
-func explicitUnlimitedOverride(username, tag string, up bool) bool {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
+func explicitUnlimitedOverride(cfg *remoteConfig, username, tag string, up bool) bool {
 	if overrides, ok := cfg.UserInboundOverrides[username]; ok {
 		if ui, ok := overrides[tag]; ok {
 			return zeroOrNil(ui, up)
@@ -180,10 +200,7 @@ func explicitUnlimitedOverride(username, tag string, up bool) bool {
 	return false
 }
 
-func localLimitBytesPerSec(username, tag string, up bool) *float64 {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-
+func localLimitBytesPerSec(cfg *remoteConfig, username, tag string, up bool) float64 {
 	var node, inbound, userInbound *float64
 	if cfg.Node != nil {
 		if up {
@@ -211,20 +228,16 @@ func localLimitBytesPerSec(username, tag string, up bool) *float64 {
 
 	limitMbps := minPositive(node, inbound, userInbound)
 	if limitMbps == nil || *limitMbps <= 0 {
-		return nil
+		return 0
 	}
-	bps := mbpsToBytesPerSec(*limitMbps)
-	return &bps
+	return mbpsToBytesPerSec(*limitMbps)
 }
 
 // userDefaultLimitBytesPerSec is username's own cap, falling back to the
 // global default unless username (or its per-inbound override, checked by
 // the caller separately) explicitly set 0 ("unlimited", not "unset").
 // Ignores tag entirely — same number regardless of which inbound asks.
-func userDefaultLimitBytesPerSec(username string, up bool) *float64 {
-	cfgMu.RLock()
-	defer cfgMu.RUnlock()
-
+func userDefaultLimitBytesPerSec(cfg *remoteConfig, username string, up bool) float64 {
 	u, userSet := cfg.Users[username]
 	var user *float64
 	if userSet {
@@ -237,7 +250,7 @@ func userDefaultLimitBytesPerSec(username string, up bool) *float64 {
 	limitMbps := user
 	if limitMbps == nil {
 		if userSet && zeroOrNil(u, up) {
-			return nil // explicit 0 at user level means unlimited
+			return 0 // explicit 0 at user level means unlimited
 		}
 		var def *float64
 		if up {
@@ -248,19 +261,18 @@ func userDefaultLimitBytesPerSec(username string, up bool) *float64 {
 		limitMbps = def
 	}
 	if limitMbps == nil || *limitMbps <= 0 {
-		return nil
+		return 0
 	}
-	bps := mbpsToBytesPerSec(*limitMbps)
-	return &bps
+	return mbpsToBytesPerSec(*limitMbps)
 }
 
 // effectiveLimitBytesPerSec is the original (pre-Scope) combined cap: min()
 // of node/inbound/user/user-inbound-override, default as fallback. Used
 // as-is for the "per_inbound" (default) scope, where everything shares one
 // per-tag bucket exactly like before Scope existed.
-func effectiveLimitBytesPerSec(username, tag string, up bool) *float64 {
-	local := localLimitBytesPerSec(username, tag, up)
-	if explicitUnlimitedOverride(username, tag, up) {
+func effectiveLimitBytesPerSec(cfg *remoteConfig, username, tag string, up bool) float64 {
+	local := localLimitBytesPerSec(cfg, username, tag, up)
+	if explicitUnlimitedOverride(cfg, username, tag, up) {
 		// Explicit 0 on this exact inbound overrides the user/default tier
 		// too, same as before Scope existed — a bare 0 (no other number set
 		// on this override) already made local nil, so this only matters
@@ -270,7 +282,11 @@ func effectiveLimitBytesPerSec(username, tag string, up bool) *float64 {
 	// minPositive skips nils, so this is correct whether userDefault is nil
 	// because nothing applies or because of an explicit unlimited-0 at user
 	// level (userDefaultLimitBytesPerSec already resolves that distinction).
-	return minPositive(local, userDefaultLimitBytesPerSec(username, up))
+	userDefault := userDefaultLimitBytesPerSec(cfg, username, up)
+	if local == 0 || userDefault > 0 && userDefault < local {
+		return userDefault
+	}
+	return local
 }
 
 func zeroOrNil(u userLimits, up bool) bool {
@@ -281,6 +297,33 @@ func zeroOrNil(u userLimits, up bool) bool {
 	return v != nil && *v == 0
 }
 
+// limitPlan is the fully resolved enforcement plan for one user, inbound and
+// direction under one immutable config snapshot. tagBytesPerSec uses the
+// per-inbound bucket; globalBytesPerSec uses Scope="total"'s cross-inbound
+// bucket. Zero means that bucket does not apply.
+type limitPlan struct {
+	tagBytesPerSec    float64
+	globalBytesPerSec float64
+}
+
+func resolveLimitPlan(cfg *remoteConfig, username, tag string, up bool) limitPlan {
+	if cfg == nil || username == "" {
+		return limitPlan{}
+	}
+	if effectiveScope(cfg, username) {
+		plan := limitPlan{tagBytesPerSec: localLimitBytesPerSec(cfg, username, tag, up)}
+		if !explicitUnlimitedOverride(cfg, username, tag, up) {
+			plan.globalBytesPerSec = userDefaultLimitBytesPerSec(cfg, username, up)
+		}
+		return plan
+	}
+	return limitPlan{tagBytesPerSec: effectiveLimitBytesPerSec(cfg, username, tag, up)}
+}
+
+func (p limitPlan) limited() bool {
+	return p.tagBytesPerSec > 0 || p.globalBytesPerSec > 0
+}
+
 // ── shared limiter registry, keyed by (username, tag, direction) ───────────
 // One limiter per user+inbound+direction, shared across every concurrent
 // connection that user has open on that inbound — mirrors _GroupState in
@@ -289,7 +332,8 @@ func zeroOrNil(u userLimits, up bool) bool {
 // scale with connection count instead of staying fixed.
 type entry struct {
 	limiter  *rate.Limiter
-	lastUsed int64 // unix seconds, atomic-free: only ever bumped under regMu
+	lastUsed atomic.Int64 // unix seconds
+	retired  atomic.Bool  // removed by idleSweeper; cached writers must refresh
 }
 
 var (
@@ -316,7 +360,8 @@ func idleSweeper() {
 		cutoff := time.Now().Add(-idleTTL).Unix()
 		regMu.Lock()
 		for k, e := range reg {
-			if e.lastUsed < cutoff {
+			if e.lastUsed.Load() < cutoff {
+				e.retired.Store(true)
 				delete(reg, k)
 			}
 		}
@@ -330,7 +375,15 @@ func idleSweeper() {
 // real per-tag bucket.
 const globalTag = ""
 
-func getLimiter(k string, bytesPerSec float64) *rate.Limiter {
+func limiterBurst(bytesPerSec float64) int {
+	burst := int(bytesPerSec * 0.2)
+	if burst < 16*1024 {
+		burst = 16 * 1024
+	}
+	return burst
+}
+
+func getLimiter(k string, bytesPerSec float64) *entry {
 	regMu.Lock()
 	defer regMu.Unlock()
 	e, ok := reg[k]
@@ -340,20 +393,18 @@ func getLimiter(k string, bytesPerSec float64) *rate.Limiter {
 		// single small request/response to a trickle, small enough that a
 		// fresh connection can't blow straight through the cap before the
 		// bucket empties.
-		burst := int(bytesPerSec * 0.2)
-		if burst < 16*1024 {
-			burst = 16 * 1024
-		}
+		burst := limiterBurst(bytesPerSec)
 		e = &entry{limiter: rate.NewLimiter(rate.Limit(bytesPerSec), burst)}
 		reg[k] = e
 	} else if e.limiter.Limit() != rate.Limit(bytesPerSec) {
 		// Limit changed since last fetch (admin edited it in the panel) —
 		// update in place so already-open connections pick it up without
 		// needing to be torn down and reconnected.
-		e.limiter.SetLimit(rate.Limit(bytesPerSec))
+		e.limiter.SetLimitAt(now, rate.Limit(bytesPerSec))
+		e.limiter.SetBurstAt(now, limiterBurst(bytesPerSec))
 	}
-	e.lastUsed = now.Unix()
-	return e.limiter
+	e.lastUsed.Store(now.Unix())
+	return e
 }
 
 // drainLimiter blocks until n bytes' worth of tokens are available from
@@ -376,6 +427,11 @@ func drainLimiter(ctx context.Context, limiter *rate.Limiter, n int) {
 	}
 }
 
+func drainEntry(ctx context.Context, e *entry, n int, now int64) {
+	e.lastUsed.Store(now)
+	drainLimiter(ctx, e.limiter, n)
+}
+
 // WaitN blocks until n bytes' worth of tokens are available for
 // username+tag+direction, or returns immediately if no limit applies
 // (unlimited, or no config has ever been pushed to this node yet).
@@ -389,7 +445,8 @@ func drainLimiter(ctx context.Context, limiter *rate.Limiter, n int) {
 // drained independently, so actual throughput is capped by whichever is
 // more restrictive at any given moment.
 func WaitN(ctx context.Context, username, tag string, up bool, n int) error {
-	if !Enabled() || username == "" || n <= 0 {
+	state := currentConfig.Load()
+	if state == nil || username == "" || n <= 0 {
 		return nil
 	}
 	dir := "down"
@@ -397,55 +454,81 @@ func WaitN(ctx context.Context, username, tag string, up bool, n int) error {
 		dir = "up"
 	}
 
-	if effectiveScope(username) {
-		if bps := localLimitBytesPerSec(username, tag, up); bps != nil {
-			drainLimiter(ctx, getLimiter(key(username, tag, dir), *bps), n)
-		}
-		if !explicitUnlimitedOverride(username, tag, up) {
-			if bps := userDefaultLimitBytesPerSec(username, up); bps != nil {
-				drainLimiter(ctx, getLimiter(key(username, globalTag, dir), *bps), n)
-			}
-		}
-		return nil
+	plan := resolveLimitPlan(&state.cfg, username, tag, up)
+	now := time.Now().Unix()
+	if plan.tagBytesPerSec > 0 {
+		drainEntry(ctx, getLimiter(key(username, tag, dir), plan.tagBytesPerSec), n, now)
 	}
-
-	if bps := effectiveLimitBytesPerSec(username, tag, up); bps != nil {
-		drainLimiter(ctx, getLimiter(key(username, tag, dir), *bps), n)
+	if plan.globalBytesPerSec > 0 {
+		drainEntry(ctx, getLimiter(key(username, globalTag, dir), plan.globalBytesPerSec), n, now)
 	}
 	return nil
 }
 
-// limitedWriter wraps a buf.Writer so every WriteMultiBuffer call first
-// blocks (via WaitN) for however many tokens its byte length costs, then
-// passes through unchanged. Zero overhead when unlimited (WaitN no-ops).
+// limitedWriter resolves and caches the shared limiter entries once per
+// config generation. The steady-state limited path does no config locking or
+// registry locking; the unlimited path is one atomic pointer comparison.
 type limitedWriter struct {
 	buf.Writer
 	ctx      context.Context
 	username string
 	tag      string
 	up       bool
+	limits   atomic.Pointer[cachedLimitPlan]
+}
+
+type cachedLimitPlan struct {
+	state   *configState
+	entries [2]*entry
 }
 
 func (w *limitedWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if n := int(mb.Len()); n > 0 {
-		_ = WaitN(w.ctx, w.username, w.tag, w.up, n) // fail-open, see WaitN doc
+		state := currentConfig.Load()
+		limits := w.limits.Load()
+		if limits == nil || state != limits.state || limits.entries[0] != nil && limits.entries[0].retired.Load() || limits.entries[1] != nil && limits.entries[1].retired.Load() {
+			limits = w.resolve(state)
+			w.limits.Store(limits)
+		}
+		if limits.entries[0] != nil || limits.entries[1] != nil {
+			now := time.Now().Unix()
+			for _, e := range limits.entries {
+				if e != nil {
+					drainEntry(w.ctx, e, n, now)
+				}
+			}
+		}
 	}
 	return w.Writer.WriteMultiBuffer(mb)
+}
+
+func (w *limitedWriter) resolve(state *configState) *cachedLimitPlan {
+	limits := &cachedLimitPlan{state: state}
+	if state == nil {
+		return limits
+	}
+	dir := "down"
+	if w.up {
+		dir = "up"
+	}
+	plan := resolveLimitPlan(&state.cfg, w.username, w.tag, w.up)
+	if plan.tagBytesPerSec > 0 {
+		limits.entries[0] = getLimiter(key(w.username, w.tag, dir), plan.tagBytesPerSec)
+	}
+	if plan.globalBytesPerSec > 0 {
+		limits.entries[1] = getLimiter(key(w.username, globalTag, dir), plan.globalBytesPerSec)
+	}
+	return limits
 }
 
 // LimitWriter wraps w so every write is throttled to the effective
 // username+tag+direction cap, if any (see WaitN). email is xray's raw
 // inbound.User.Email ("{id}.{username}[#tag]") — normalized internally.
 //
-// Deliberately does NOT gate on Enabled() here: unlike the old poll design
-// (where enabled was fixed true from process start, before any traffic
-// flowed), the push design's Enabled() can flip from false to true AFTER a
-// connection is already established — right after a restart, before
-// node.py's post-restart push has landed. Gating the wrap here would freeze
-// that connection unwrapped for its entire (possibly long-lived XHTTP/
-// VLESS) lifetime even once a push arrives. WaitN() already checks
-// Enabled() on every call, so wrapping unconditionally costs one no-op
-// function call per write when disabled — negligible, and always correct.
+// Deliberately does NOT gate on Enabled() here: config can arrive or change
+// after a connection is established. The wrapper's atomic generation check
+// makes that update visible on its next write without registry/config locks
+// in steady state.
 func LimitWriter(ctx context.Context, w buf.Writer, email, tag string, up bool) buf.Writer {
 	if email == "" {
 		return w
@@ -458,9 +541,60 @@ func LimitWriter(ctx context.Context, w buf.Writer, email, tag string, up bool) 
 // now. False right after a fresh xray-core start, until node.py's
 // post-start push (or the next admin-triggered push) lands.
 func Enabled() bool {
-	hasConfigMu.RLock()
-	defer hasConfigMu.RUnlock()
-	return hasConfig
+	return currentConfig.Load() != nil
+}
+
+// FastPathGuard proves that no speed limit applies to one connection
+// direction under a specific immutable config snapshot. It must be activated
+// immediately before entering a zero-copy path; activation fails if a newer
+// snapshot won the race in between.
+type FastPathGuard struct {
+	state *configState
+}
+
+// AllowFastPath returns a guard only for an identified user whose fully
+// resolved effective limit is unlimited for this inbound and direction. It
+// intentionally returns nil before the first config push: the short startup
+// window stays on the buffered path so a later push can affect the connection.
+func AllowFastPath(email, tag string, up bool) *FastPathGuard {
+	username := Username(email)
+	state := currentConfig.Load()
+	if state == nil || username == "" || resolveLimitPlan(&state.cfg, username, tag, up).limited() {
+		return nil
+	}
+	return &FastPathGuard{state: state}
+}
+
+// Activate registers interrupt for the lifetime of a zero-copy operation.
+// Every config push interrupts all active fast paths so long-lived sessions
+// reconnect and cannot retain an outdated unlimited decision. The returned
+// stop function is safe to call more than once.
+func (g *FastPathGuard) Activate(interrupt func()) (stop func(), ok bool) {
+	if g == nil || interrupt == nil {
+		return func() {}, false
+	}
+	watcher := &fastPathWatcher{interrupt: interrupt}
+	watcher.active.Store(true)
+
+	fastPathMu.Lock()
+	if currentConfig.Load() != g.state {
+		fastPathMu.Unlock()
+		watcher.active.Store(false)
+		return func() {}, false
+	}
+	fastPathNextID++
+	id := fastPathNextID
+	fastPathWatchers[id] = watcher
+	fastPathMu.Unlock()
+
+	return func() {
+		if !watcher.active.Swap(false) {
+			return
+		}
+		fastPathMu.Lock()
+		delete(fastPathWatchers, id)
+		fastPathMu.Unlock()
+	}, true
 }
 
 // Username normalizes xray's inbound.User.Email ("{id}.{username}" or

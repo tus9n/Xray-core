@@ -24,8 +24,8 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/retry"
 	"github.com/xtls/xray-core/common/session"
-	"github.com/xtls/xray-core/common/speedlimit"
 	"github.com/xtls/xray-core/common/signal"
+	"github.com/xtls/xray-core/common/speedlimit"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/common/xudp"
 	"github.com/xtls/xray-core/core"
@@ -420,16 +420,22 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
-		if requestAddons.Flow == vless.XRV && !speedlimit.Enabled() {
-			// Marzban: XTLS Vision's splice-like fast path never goes through
-			// speedlimit.LimitWriter (it writes straight to clientWriter), so
-			// it's only safe to take while no per-user/per-inbound limit is
-			// configured on this node at all. The external tc shaper this
-			// used to lean on for raw TCP+REALITY inbounds was removed from
-			// Marzban-node in favor of this push-based limiter — there is no
-			// other enforcement left for this path once limits are enabled.
-			err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx)
-		} else {
+		usedFastPath := false
+		if requestAddons.Flow == vless.XRV && speedlimitInbound != nil && speedlimitInbound.User != nil {
+			// XtlsRead may switch to a splice-like path that bypasses
+			// LimitWriter. Permit it only when this exact user/tag/direction is
+			// effectively unlimited. A later config push closes conn so an
+			// already-open fast path cannot retain stale unlimited privileges.
+			if guard := speedlimit.AllowFastPath(speedlimitInbound.User.Email, speedlimitInbound.Tag, false); guard != nil {
+				stop, ok := guard.Activate(func() { _ = conn.Close() })
+				if ok {
+					defer stop()
+					err = encoding.XtlsRead(serverReader, clientWriter, timer, conn, trafficState, false, ctx)
+					usedFastPath = true
+				}
+			}
+		}
+		if !usedFastPath {
 			limitedClientWriter := clientWriter
 			if speedlimitInbound != nil && speedlimitInbound.User != nil {
 				limitedClientWriter = speedlimit.LimitWriter(ctx, clientWriter, speedlimitInbound.User.Email, speedlimitInbound.Tag, false)
