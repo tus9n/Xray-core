@@ -414,7 +414,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		if requestAddons.Flow == vless.XRV && speedlimitInbound != nil && speedlimitInbound.User != nil {
 			// XtlsRead may switch to a splice-like path that bypasses
 			// LimitWriter. Permit it only when this exact user/tag/direction is
-			// effectively unlimited. A later config push closes conn so an
+			// effectively unlimited. A later config push that limits it closes conn so an
 			// already-open fast path cannot retain stale unlimited privileges.
 			if guard := speedlimit.AllowFastPath(speedlimitInbound.User.Email, speedlimitInbound.Tag, false); guard != nil {
 				stop, ok := guard.Activate(func() { _ = conn.Close() })

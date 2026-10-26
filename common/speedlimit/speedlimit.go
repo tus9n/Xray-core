@@ -111,6 +111,9 @@ var (
 type fastPathWatcher struct {
 	active    atomic.Bool
 	interrupt func()
+	username  string
+	tag       string
+	up        bool
 }
 
 // handleSpeedLimitsPush is registered on the shared listener (see
@@ -138,15 +141,26 @@ func handleSpeedLimitsPush(w http.ResponseWriter, r *http.Request) {
 
 func publishConfig(next remoteConfig) {
 	fastPathMu.Lock()
-	currentConfig.Store(&configState{cfg: next})
-	watchers := fastPathWatchers
-	fastPathWatchers = map[uint64]*fastPathWatcher{}
+	state := &configState{cfg: next}
+	currentConfig.Store(state)
+	// Only fast paths that the new snapshot actually limits are interrupted.
+	// The rest stay registered under the same id (so their stop() still
+	// finds them) and remain subject to every later push — a push that
+	// limits nobody new must not reconnect unrelated unlimited sessions
+	// (e.g. bridge/balancer service accounts carrying many users).
+	var interrupt []*fastPathWatcher
+	for id, watcher := range fastPathWatchers {
+		if resolveLimitPlan(&state.cfg, watcher.username, watcher.tag, watcher.up).limited() {
+			delete(fastPathWatchers, id)
+			interrupt = append(interrupt, watcher)
+		}
+	}
 	fastPathMu.Unlock()
 
 	// Closing a net.Conn is non-blocking and is intentionally done outside
-	// fastPathMu. It makes long-lived zero-copy connections reconnect and be
+	// fastPathMu. It makes those zero-copy connections reconnect and be
 	// re-evaluated against the just-published limits.
-	for _, watcher := range watchers {
+	for _, watcher := range interrupt {
 		if watcher.active.Swap(false) {
 			watcher.interrupt()
 		}
@@ -549,7 +563,10 @@ func Enabled() bool {
 // immediately before entering a zero-copy path; activation fails if a newer
 // snapshot won the race in between.
 type FastPathGuard struct {
-	state *configState
+	state    *configState
+	username string
+	tag      string
+	up       bool
 }
 
 // AllowFastPath returns a guard only for an identified user whose fully
@@ -562,18 +579,18 @@ func AllowFastPath(email, tag string, up bool) *FastPathGuard {
 	if state == nil || username == "" || resolveLimitPlan(&state.cfg, username, tag, up).limited() {
 		return nil
 	}
-	return &FastPathGuard{state: state}
+	return &FastPathGuard{state: state, username: username, tag: tag, up: up}
 }
 
 // Activate registers interrupt for the lifetime of a zero-copy operation.
-// Every config push interrupts all active fast paths so long-lived sessions
-// reconnect and cannot retain an outdated unlimited decision. The returned
+// A config push that limits this user/tag/direction interrupts it so the
+// session reconnects and cannot retain an outdated unlimited decision. The returned
 // stop function is safe to call more than once.
 func (g *FastPathGuard) Activate(interrupt func()) (stop func(), ok bool) {
 	if g == nil || interrupt == nil {
 		return func() {}, false
 	}
-	watcher := &fastPathWatcher{interrupt: interrupt}
+	watcher := &fastPathWatcher{interrupt: interrupt, username: g.username, tag: g.tag, up: g.up}
 	watcher.active.Store(true)
 
 	fastPathMu.Lock()
