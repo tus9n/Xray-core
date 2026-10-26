@@ -509,7 +509,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			// Splice bypasses both LimitWriter and torrentguard's byte tracking.
 			// tgHandle==nil proves the latter is inactive/exempt; the guard proves
 			// this direction is effectively unlimited under the current speed
-			// config. Any later config push closes conn, forcing a reconnect and
+			// config. A later config push that limits it closes conn, forcing a reconnect and
 			// re-evaluation before a new limit can be bypassed.
 			if guard := speedlimit.AllowFastPath(inbound.User.Email, inbound.Tag, false); guard != nil {
 				stop, ok := guard.Activate(func() { _ = conn.Close() })
