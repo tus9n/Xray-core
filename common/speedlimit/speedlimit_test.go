@@ -113,6 +113,72 @@ func TestFastPathGuardInterruptedByConfigPush(t *testing.T) {
 	}
 }
 
+func TestFastPathGuardSurvivesUnrelatedConfigPush(t *testing.T) {
+	resetSpeedlimitTestState(t)
+	publishConfig(remoteConfig{Users: map[string]userLimits{
+		"svc": {DownMbps: floatPtr(0), UpMbps: floatPtr(0)},
+	}})
+	guard := AllowFastPath("1.svc#vless", "vless", false)
+	if guard == nil {
+		t.Fatal("explicitly unlimited service user should receive a fast-path guard")
+	}
+	var interrupted atomic.Int32
+	stop, ok := guard.Activate(func() { interrupted.Add(1) })
+	if !ok {
+		t.Fatal("fresh guard activation failed")
+	}
+
+	// Another user on the same tag gets throttled — svc must keep its session.
+	publishConfig(remoteConfig{
+		Users: map[string]userLimits{"svc": {DownMbps: floatPtr(0), UpMbps: floatPtr(0)}},
+		UserInboundOverrides: map[string]map[string]userLimits{
+			"bob": {"vless": {DownMbps: floatPtr(0.01), UpMbps: floatPtr(0.01)}},
+		},
+	})
+	if got := interrupted.Load(); got != 0 {
+		t.Fatalf("unrelated push interrupted fast path %d times, want 0", got)
+	}
+
+	// Its own limit appears on a later push — now it must be interrupted once.
+	publishConfig(remoteConfig{Users: map[string]userLimits{"svc": {DownMbps: floatPtr(5)}}})
+	if got := interrupted.Load(); got != 1 {
+		t.Fatalf("limiting push interrupted fast path %d times, want 1", got)
+	}
+	publishConfig(remoteConfig{Users: map[string]userLimits{"svc": {DownMbps: floatPtr(5)}}})
+	if got := interrupted.Load(); got != 1 {
+		t.Fatalf("interrupted watcher fired again: got %d calls", got)
+	}
+	stop()
+}
+
+func TestFastPathGuardStopAfterSurvivedPush(t *testing.T) {
+	resetSpeedlimitTestState(t)
+	publishConfig(remoteConfig{})
+	guard := AllowFastPath("1.alice", "vless", false)
+	if guard == nil {
+		t.Fatal("unlimited user should receive a fast-path guard")
+	}
+	var interrupted atomic.Int32
+	stop, ok := guard.Activate(func() { interrupted.Add(1) })
+	if !ok {
+		t.Fatal("fresh guard activation failed")
+	}
+	publishConfig(remoteConfig{})
+	stop()
+	limited := remoteConfig{}
+	limited.Default.DownMbps = floatPtr(5)
+	publishConfig(limited)
+	if got := interrupted.Load(); got != 0 {
+		t.Fatalf("stopped guard was interrupted %d times", got)
+	}
+	fastPathMu.Lock()
+	n := len(fastPathWatchers)
+	fastPathMu.Unlock()
+	if n != 0 {
+		t.Fatalf("stopped guard left %d watchers registered", n)
+	}
+}
+
 func TestFastPathGuardStopPreventsInterrupt(t *testing.T) {
 	resetSpeedlimitTestState(t)
 	publishConfig(remoteConfig{})
