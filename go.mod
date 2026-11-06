@@ -69,3 +69,6 @@ tool (
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc
 	google.golang.org/protobuf/cmd/protoc-gen-go
 )
+
+// Marzban patch: own copy of xtls/reality (accepts a Client Hello with plain X25519, see third_party/reality/tls.go)
+replace github.com/xtls/reality => ./third_party/reality
