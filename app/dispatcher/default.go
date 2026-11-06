@@ -2,6 +2,8 @@ package dispatcher
 
 import (
 	"context"
+	"github.com/xtls/xray-core/common/speedlimit"
+	"github.com/xtls/xray-core/common/torrentguard"
 	"strings"
 	"sync"
 	"time"
@@ -184,6 +186,13 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		}
 	}
 
+	// Marzban patch: torrentguard for non-freedom outbounds, activated in
+	// routedDispatch — see common/torrentguard/deferred.go.
+	if tg := torrentguard.DeferredFromContext(ctx); tg != nil {
+		inboundLink.Writer = tg.Writer(inboundLink.Writer, true)
+		outboundLink.Writer = tg.Writer(outboundLink.Writer, false)
+	}
+
 	return inboundLink, outboundLink
 }
 
@@ -218,7 +227,32 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 		}
 	}
 
+	// Marzban patch: torrentguard for non-freedom outbounds, activated in
+	// routedDispatch — see common/torrentguard/deferred.go. Upload is counted
+	// through the reader's counter: the reader itself must stay a
+	// *buf.TimeoutWrapperReader (type-asserted above and by the sniffer).
+	if tg := torrentguard.DeferredFromContext(ctx); tg != nil {
+		r := link.Reader.(*buf.TimeoutWrapperReader)
+		r.Counter = tg.UplinkCounter(r.Counter)
+		link.Writer = tg.Writer(link.Writer, false)
+	}
+
 	return link
+}
+
+// withTorrentGuard attaches a torrentguard.Deferred for the inbound user, if
+// any (Marzban patch, see common/torrentguard/deferred.go).
+func withTorrentGuard(ctx context.Context) context.Context {
+	inbound := session.InboundFromContext(ctx)
+	if inbound == nil || inbound.User == nil {
+		return ctx
+	}
+	var sourceIP string
+	if inbound.Source.IsValid() {
+		sourceIP = inbound.Source.Address.String()
+	}
+	return torrentguard.ContextWithDeferred(ctx,
+		torrentguard.NewDeferred(ctx, speedlimit.Username(inbound.User.Email), sourceIP))
 }
 
 func trackOnlineIP(ctx context.Context, sm stats.Manager, email, ip string) {
@@ -283,6 +317,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	}
 
 	sniffingRequest := content.SniffingRequest
+	ctx = withTorrentGuard(ctx)
 	inbound, outbound := d.getLink(ctx)
 	if !sniffingRequest.Enabled {
 		go d.routedDispatch(ctx, outbound, destination)
@@ -338,6 +373,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		content = new(session.Content)
 		ctx = session.ContextWithContent(ctx, content)
 	}
+	ctx = withTorrentGuard(ctx)
 	outbound = WrapLink(ctx, d.policy, d.stats, outbound)
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled {
@@ -502,6 +538,26 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			}
 		}
 		log.Record(accessMessage)
+	}
+
+	// Marzban patch: torrentguard for outbounds other than freedom (freedom
+	// tracks itself) — e.g. a bridge entry node's VLESS relay. Destination is
+	// what the client asked for (IP for P2P peers), before any sniffing
+	// override; see common/torrentguard/deferred.go.
+	if tg := torrentguard.DeferredFromContext(ctx); tg != nil {
+		if u, ok := handler.(interface{ TorrentGuardUntracked() bool }); !ok || !u.TorrentGuardUntracked() {
+			if tg.ShouldDrop() {
+				errors.LogInfo(ctx, "torrentguard: refusing new connection to ", destination, " (enforced)")
+				common.Close(link.Writer)
+				common.Interrupt(link.Reader)
+				return
+			}
+			dest := destination
+			if ob.OriginalTarget.IsValid() {
+				dest = ob.OriginalTarget
+			}
+			tg.Activate(dest.Address.String())
+		}
 	}
 
 	handler.Dispatch(ctx, link)
