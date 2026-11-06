@@ -363,24 +363,31 @@ type enforceWriter struct {
 
 func (w *enforceWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	if w.handle != nil && w.handle.state.enforced.Load() {
-		if n := int(mb.Len()); n > 0 {
-			limiter := w.handle.state.limiterFor(w.throttleMbps)
-			if limiter != nil {
-				burst := limiter.Burst()
-				for n > 0 {
-					take := n
-					if take > burst {
-						take = burst
-					}
-					if err := limiter.WaitN(w.ctx, take); err != nil {
-						break // fail-open: never hang the proxy on our own account
-					}
-					n -= take
-				}
-			}
-		}
+		throttle(w.ctx, w.handle, int(mb.Len()), w.throttleMbps)
 	}
 	return w.Writer.WriteMultiBuffer(mb)
+}
+
+// throttle waits until the enforced pair's shared limiter admits n bytes.
+func throttle(ctx context.Context, handle *ConnHandle, n int, throttleMbps float64) {
+	if n <= 0 {
+		return
+	}
+	limiter := handle.state.limiterFor(throttleMbps)
+	if limiter == nil {
+		return
+	}
+	burst := limiter.Burst()
+	for n > 0 {
+		take := n
+		if take > burst {
+			take = burst
+		}
+		if err := limiter.WaitN(ctx, take); err != nil {
+			return // fail-open: never hang the proxy on our own account
+		}
+		n -= take
+	}
 }
 
 func (s *userState) limiterFor(throttleMbps float64) *rate.Limiter {

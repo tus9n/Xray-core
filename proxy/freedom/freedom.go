@@ -903,3 +903,8 @@ func GenerateRandomBytes(n int64) ([]byte, error) {
 
 	return b, nil
 }
+
+// TorrentGuardUntracked implements torrentguard.Untracked (Marzban patch):
+// the dispatcher must not count connections through this outbound, see
+// common/torrentguard/deferred.go.
+func (*Handler) TorrentGuardUntracked() {}

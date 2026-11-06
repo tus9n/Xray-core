@@ -86,3 +86,8 @@ func init() {
 		return New(ctx, config.(*Config))
 	}))
 }
+
+// TorrentGuardUntracked implements torrentguard.Untracked (Marzban patch):
+// the dispatcher must not count connections through this outbound, see
+// common/torrentguard/deferred.go.
+func (*Handler) TorrentGuardUntracked() {}

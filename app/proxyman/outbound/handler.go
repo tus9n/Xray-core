@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	goerrors "errors"
+	"github.com/xtls/xray-core/common/torrentguard"
 	"io"
 	"math/big"
 
@@ -315,6 +316,13 @@ func (h *Handler) getStatCouterConnection(conn stat.Connection) stat.Connection 
 		}
 	}
 	return conn
+}
+
+// TorrentGuardUntracked reports whether the dispatcher must skip torrentguard
+// for this outbound (Marzban patch, see common/torrentguard/deferred.go).
+func (h *Handler) TorrentGuardUntracked() bool {
+	_, ok := h.proxy.(torrentguard.Untracked)
+	return ok
 }
 
 // GetOutbound implements proxy.GetOutbound.
