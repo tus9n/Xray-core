@@ -86,18 +86,22 @@ type Handler struct {
 	// regexps               map[string]*regexp.Regexp       // or nil
 }
 
-// [MARZBAN] Подключение по отпечатку ClientHello (REALITY) — в агрегатор
-// common/clienthello (не в общий stats.Manager, см. там почему); панель читает его
-// через StatsService.QueryStats с шаблоном "clienthello>>>".
+// [MARZBAN] Соединение по отпечатку ClientHello — в агрегатор common/clienthello
+// (не в общий stats.Manager, см. там почему); панель читает его через
+// StatsService.QueryStats с шаблоном "clienthello>>>". Отпечаток отдают соединение
+// REALITY поверх TCP (transport/internet/reality.Conn) и поток XHTTP поверх REALITY
+// (transport/internet/splithttp.splitConn).
 func (h *Handler) countClientHello(iConn stat.Connection, email, tag string) {
 	if email == "" {
 		return
 	}
-	rc, ok := iConn.(*reality.Conn)
-	if !ok || rc.Conn == nil || rc.Conn.ClientHelloJA4 == "" {
+	p, ok := iConn.(interface{ ClientHelloJA4() (string, int) })
+	if !ok {
 		return
 	}
-	clienthello.Record(email, tag, rc.Conn.ClientHelloJA4, rc.Conn.ClientHelloLen)
+	if ja4, length := p.ClientHelloJA4(); ja4 != "" {
+		clienthello.Record(email, tag, ja4, length)
+	}
 }
 
 // New creates a new VLess inbound handler.

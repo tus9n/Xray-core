@@ -94,6 +94,9 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 	return s
 }
 
+// realityConnKey — ключ контекста запроса с соединением REALITY ([MARZBAN]).
+type realityConnKey struct{}
+
 func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if len(h.host) > 0 && !internet.IsValidHTTPHost(request.Host, h.host) {
 		errors.LogInfo(context.Background(), "failed to validate host, request:", request.Host, ", config:", h.host)
@@ -387,6 +390,9 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			remoteAddr: remoteAddr,
 			localAddr:  localAddr,
 		}
+		if rc, ok := request.Context().Value(realityConnKey{}).(*goreality.Conn); ok && rc != nil {
+			conn.helloJA4, conn.helloLen = rc.ClientHelloJA4, rc.ClientHelloLen
+		}
 		if sessionId != "" { // if not stream-one
 			conn.reader = currentSession.uploadQueue
 		}
@@ -569,7 +575,15 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		protocols.SetHTTP1(true)
 		protocols.SetUnencryptedHTTP2(true)
 		l.server = http.Server{
-			Handler:           handler,
+			Handler: handler,
+			// [MARZBAN] соединение REALITY — в контекст запросов: из него берётся
+			// отпечаток ClientHello (JA4) для статистики по пользователю.
+			ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+				if rc, ok := c.(*goreality.Conn); ok {
+					return context.WithValue(ctx, realityConnKey{}, rc)
+				}
+				return ctx
+			},
 			ReadHeaderTimeout: time.Second * 4,
 			MaxHeaderBytes:    l.config.GetNormalizedServerMaxHeaderBytes(),
 			Protocols:         protocols,

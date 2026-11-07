@@ -12,6 +12,15 @@ type splitConn struct {
 	remoteAddr net.Addr
 	localAddr  net.Addr
 	onClose    func()
+	// [MARZBAN] отпечаток ClientHello соединения REALITY, по которому пришёл запрос
+	// (hub.go, ConnContext) — для статистики по пользователю в VLESS inbound.
+	helloJA4 string
+	helloLen int
+}
+
+// ClientHelloJA4 — [MARZBAN] JA4 и длина ClientHello (пусто, если не REALITY).
+func (c *splitConn) ClientHelloJA4() (string, int) {
+	return c.helloJA4, c.helloLen
 }
 
 func (c *splitConn) Write(b []byte) (int, error) {
