@@ -31,6 +31,10 @@ type Conn struct {
 	ClientTime        time.Time
 	ClientShortId     [8]byte
 	MaxUselessRecords int
+	// [MARZBAN] отпечаток ClientHello прошедшего проверку клиента (ja4.go):
+	// JA4 и длина сообщения ClientHello в байтах.
+	ClientHelloJA4 string
+	ClientHelloLen int
 	// [REALITY] SECTION END
 
 	// constant

@@ -282,6 +282,9 @@ func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 					(config.MaxTimeDiff == 0 || time.Since(hs.c.ClientTime).Abs() <= config.MaxTimeDiff) &&
 					(config.ShortIds[hs.c.ClientShortId]) {
 					hs.c.conn = conn
+					// [MARZBAN] отпечаток клиента — для статистики по пользователю (VLESS inbound)
+					hs.c.ClientHelloJA4 = ja4(hs.clientHello)
+					hs.c.ClientHelloLen = len(hs.clientHello.original)
 				}
 				break
 			}

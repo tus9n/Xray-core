@@ -85,6 +85,25 @@ type Handler struct {
 	// regexps               map[string]*regexp.Regexp       // or nil
 }
 
+// [MARZBAN] Счётчик подключений по отпечатку ClientHello (REALITY): имя
+// "clienthello>>>{email}>>>{тег инбаунда}>>>{JA4}>>>{длина ClientHello}", значение —
+// число подключений. Панель читает их QueryStats("clienthello>>>", reset) — так видно,
+// каким uTLS-отпечатком реально подключается пользователь. Префикс не содержит
+// "user>>>"/"inbound>>>"/"outbound>>>" — шаблоны статистики трафика его не цепляют.
+func (h *Handler) countClientHello(iConn stat.Connection, email, tag string) {
+	if h.stats == nil || email == "" {
+		return
+	}
+	rc, ok := iConn.(*reality.Conn)
+	if !ok || rc.Conn == nil || rc.Conn.ClientHelloJA4 == "" {
+		return
+	}
+	name := "clienthello>>>" + email + ">>>" + tag + ">>>" + rc.Conn.ClientHelloJA4 + ">>>" + strconv.Itoa(rc.Conn.ClientHelloLen)
+	if c, _ := h.stats.GetOrRegisterCounter(name); c != nil {
+		c.Add(1)
+	}
+}
+
 // New creates a new VLess inbound handler.
 func New(ctx context.Context, config *Config, dc dns.Client, validator vless.Validator) (*Handler, error) {
 	v := core.MustFromContext(ctx)
@@ -534,6 +553,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	inbound.Name = "vless"
 	inbound.User = request.User
 	inbound.VlessRoute = net.PortFromBytes(userSentID[6:8])
+	h.countClientHello(iConn, request.User.Email, inbound.Tag)
 
 	account := request.User.Account.(*vless.MemoryAccount)
 
