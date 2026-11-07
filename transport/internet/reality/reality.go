@@ -40,6 +40,14 @@ type Conn struct {
 	suppressCloseNotify atomic.Bool
 }
 
+// ClientHelloJA4 — [MARZBAN] JA4 и длина ClientHello клиента (third_party/reality/ja4.go).
+func (c *Conn) ClientHelloJA4() (string, int) {
+	if c.Conn == nil {
+		return "", 0
+	}
+	return c.Conn.ClientHelloJA4, c.Conn.ClientHelloLen
+}
+
 func (c *Conn) SuppressCloseNotify() {
 	c.suppressCloseNotify.Store(true)
 }
