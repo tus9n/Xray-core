@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/clienthello"
 	"github.com/xtls/xray-core/core"
 	feature_stats "github.com/xtls/xray-core/features/stats"
 	grpc "google.golang.org/grpc"
@@ -163,6 +164,16 @@ func (s *statsServer) GetUsersStats(ctx context.Context, request *GetUsersStatsR
 
 func (s *statsServer) QueryStats(ctx context.Context, request *QueryStatsRequest) (*QueryStatsResponse, error) {
 	response := &QueryStatsResponse{}
+
+	// [MARZBAN] отпечатки ClientHello — отдельный агрегатор (common/clienthello):
+	// чтение всегда забирает накопленное и очищает его (reset подразумевается),
+	// общая карта счётчиков при этом не перебирается.
+	if strings.HasPrefix(request.Pattern, clienthello.Prefix) {
+		for _, e := range clienthello.Drain() {
+			response.Stat = append(response.Stat, &Stat{Name: e.Name, Value: e.Value})
+		}
+		return response, nil
+	}
 
 	s.stats.VisitCounters(func(name string, c feature_stats.Counter) bool {
 		if strings.Contains(name, request.Pattern) {
