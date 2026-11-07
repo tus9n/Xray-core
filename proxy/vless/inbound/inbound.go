@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/app/reverse"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/clienthello"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/mux"
@@ -85,23 +86,18 @@ type Handler struct {
 	// regexps               map[string]*regexp.Regexp       // or nil
 }
 
-// [MARZBAN] Счётчик подключений по отпечатку ClientHello (REALITY): имя
-// "clienthello>>>{email}>>>{тег инбаунда}>>>{JA4}>>>{длина ClientHello}", значение —
-// число подключений. Панель читает их QueryStats("clienthello>>>", reset) — так видно,
-// каким uTLS-отпечатком реально подключается пользователь. Префикс не содержит
-// "user>>>"/"inbound>>>"/"outbound>>>" — шаблоны статистики трафика его не цепляют.
+// [MARZBAN] Подключение по отпечатку ClientHello (REALITY) — в агрегатор
+// common/clienthello (не в общий stats.Manager, см. там почему); панель читает его
+// через StatsService.QueryStats с шаблоном "clienthello>>>".
 func (h *Handler) countClientHello(iConn stat.Connection, email, tag string) {
-	if h.stats == nil || email == "" {
+	if email == "" {
 		return
 	}
 	rc, ok := iConn.(*reality.Conn)
 	if !ok || rc.Conn == nil || rc.Conn.ClientHelloJA4 == "" {
 		return
 	}
-	name := "clienthello>>>" + email + ">>>" + tag + ">>>" + rc.Conn.ClientHelloJA4 + ">>>" + strconv.Itoa(rc.Conn.ClientHelloLen)
-	if c, _ := h.stats.GetOrRegisterCounter(name); c != nil {
-		c.Add(1)
-	}
+	clienthello.Record(email, tag, rc.Conn.ClientHelloJA4, rc.Conn.ClientHelloLen)
 }
 
 // New creates a new VLess inbound handler.
