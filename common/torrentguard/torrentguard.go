@@ -243,6 +243,14 @@ func RecordOpen(ctx context.Context, username, sourceIP, destIP string) *ConnHan
 	}
 	s.conns = append(kept, handle)
 	s.lastUsed = now
+	// Unique destination IPs can't exceed the number of connections, so while
+	// the window holds no more connections than the alert threshold nothing
+	// can fire — skip the copy and the per-open map/symmetry scan (the common
+	// case: a normal user opens far fewer than that within the window).
+	if c.MaxUniqueIPsAlert <= 0 || len(s.conns) <= c.MaxUniqueIPsAlert {
+		s.mu.Unlock()
+		return handle
+	}
 	conns := append([]*ConnHandle(nil), s.conns...)
 	s.mu.Unlock()
 
@@ -341,6 +349,25 @@ func (w *trackWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 	}
 	return w.Writer.WriteMultiBuffer(mb)
+}
+
+// Account counts n bytes moved over handle's connection outside the writer
+// chain (metered splice, proxy/splice_meter.go) and applies the same
+// throttle EnforceWriter would. Safe on a nil handle.
+func (h *ConnHandle) Account(ctx context.Context, n int64, up bool) {
+	if h == nil || n <= 0 {
+		return
+	}
+	if up {
+		atomic.AddInt64(&h.bytesUp, n)
+	} else {
+		atomic.AddInt64(&h.bytesDown, n)
+	}
+	if h.state.enforced.Load() {
+		if c := snapshot(); c.Action != "drop" {
+			throttle(ctx, h, int(n), c.ThrottleMbps)
+		}
+	}
 }
 
 // TrackWriter wraps w so bytes moved over handle's connection are counted

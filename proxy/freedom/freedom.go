@@ -499,7 +499,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	responseDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-		if destination.Network == net.Network_TCP && useSplice() && tgHandle == nil && inbound != nil && inbound.User != nil && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
+		// Marzban patch: the writer chain of the download direction —
+		// torrentguard tracking/enforcement and the per-user speed cap. Built
+		// first so the metered splice below uses it before splicing starts.
+		limitedOutput := output
+		limitedOutput = torrentguard.TrackWriter(limitedOutput, tgHandle, false)
+		limitedOutput = torrentguard.EnforceWriter(ctx, limitedOutput, tgHandle, false)
+		if inbound != nil && inbound.User != nil {
+			limitedOutput = speedlimit.LimitWriter(ctx, limitedOutput, inbound.User.Email, inbound.Tag, false)
+			if destination.Network == net.Network_TCP {
+				capReadBuffer(conn, speedlimit.RateBytesPerSec(inbound.User.Email, inbound.Tag, false))
+			}
+		}
+		if destination.Network == net.Network_TCP && useSplice() && inbound != nil && inbound.User != nil && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
 			var writeConn net.Conn
 			var inTimer *signal.ActivityTimer
 			if inbound.Conn != nil {
@@ -511,12 +523,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			// this direction is effectively unlimited under the current speed
 			// config. A later config push that limits it closes conn, forcing a reconnect and
 			// re-evaluation before a new limit can be bypassed.
-			if guard := speedlimit.AllowFastPath(inbound.User.Email, inbound.Tag, false); guard != nil {
-				stop, ok := guard.Activate(func() { _ = conn.Close() })
-				if ok {
-					defer stop()
-					return proxy.CopyRawConnIfExist(ctx, conn, writeConn, link.Writer, timer, inTimer)
+			if tgHandle == nil {
+				if guard := speedlimit.AllowFastPath(inbound.User.Email, inbound.Tag, false); guard != nil {
+					stop, ok := guard.Activate(func() { _ = conn.Close() })
+					if ok {
+						defer stop()
+						return proxy.CopyRawConnIfExist(ctx, conn, writeConn, link.Writer, timer, inTimer)
+					}
 				}
+			}
+			// Limited and/or torrent-tracked user: splice in metered chunks —
+			// same limiter, same accounting, kernel copy (proxy/splice_meter.go).
+			if m := newSpliceMeter(inbound.User.Email, inbound.Tag, tgHandle, output); m != nil {
+				return proxy.CopyRawConnIfExist(proxy.WithSpliceMeter(ctx, m), conn, writeConn, limitedOutput, timer, inTimer)
 			}
 		}
 		var reader buf.Reader
@@ -524,17 +543,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			reader = buf.NewReader(conn)
 		} else {
 			reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
-		}
-		// Marzban patch: torrentguard fan-out/symmetry tracking + enforcement,
-		// mirrors requestDone above. `up: false` — destination->client.
-		limitedOutput := output
-		limitedOutput = torrentguard.TrackWriter(limitedOutput, tgHandle, false)
-		limitedOutput = torrentguard.EnforceWriter(ctx, limitedOutput, tgHandle, false)
-
-		// Marzban patch: per-user download cap, mirrors requestDone above.
-		// `up: false` — destination->client direction.
-		if inbound != nil && inbound.User != nil {
-			limitedOutput = speedlimit.LimitWriter(ctx, limitedOutput, inbound.User.Email, inbound.Tag, false)
 		}
 		if err := buf.Copy(reader, limitedOutput, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to process response").Base(err)

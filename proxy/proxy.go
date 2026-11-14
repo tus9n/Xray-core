@@ -775,6 +775,18 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if inTimer != nil {
 				inTimer.SetTimeout(24 * time.Hour)
 			}
+			// Marzban patch: limited/tracked users splice in metered chunks
+			// (see splice_meter.go); the meter accounts user stats itself.
+			if m := spliceMeterFrom(ctx); m != nil {
+				var rc, wc byteCounter
+				if readCounter != nil {
+					rc = readCounter
+				}
+				if writeCounter != nil {
+					wc = writeCounter
+				}
+				return meteredSplice(ctx, m, tc, readerConn, rc, wc)
+			}
 			w, err := tc.ReadFrom(readerConn)
 			if readCounter != nil {
 				readCounter.Add(w) // outbound stats

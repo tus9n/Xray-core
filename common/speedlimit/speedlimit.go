@@ -479,6 +479,23 @@ func WaitN(ctx context.Context, username, tag string, up bool, n int) error {
 	return nil
 }
 
+// RateBytesPerSec is the strictest cap (bytes/s) that applies to
+// email+tag+direction right now, 0 if unlimited or no config yet. Used by the
+// metered splice to size its chunks (see proxy/splice_meter.go).
+func RateBytesPerSec(email, tag string, up bool) float64 {
+	state := currentConfig.Load()
+	username := Username(email)
+	if state == nil || username == "" {
+		return 0
+	}
+	plan := resolveLimitPlan(&state.cfg, username, tag, up)
+	r := plan.tagBytesPerSec
+	if plan.globalBytesPerSec > 0 && (r <= 0 || plan.globalBytesPerSec < r) {
+		r = plan.globalBytesPerSec
+	}
+	return r
+}
+
 // limitedWriter resolves and caches the shared limiter entries once per
 // config generation. The steady-state limited path does no config locking or
 // registry locking; the unlimited path is one atomic pointer comparison.

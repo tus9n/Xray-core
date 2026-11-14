@@ -138,6 +138,10 @@ type deferredWriter struct {
 	up bool
 }
 
+// Unwrap exposes the wrapped writer (metered splice looks for the user stats
+// counter underneath).
+func (w *deferredWriter) Unwrap() buf.Writer { return w.Writer }
+
 func (w *deferredWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	w.d.account(int64(mb.Len()), w.up)
 	return w.Writer.WriteMultiBuffer(mb)
