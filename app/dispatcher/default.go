@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/xtls/xray-core/common/speedlimit"
 	"github.com/xtls/xray-core/common/torrentguard"
+	"github.com/xtls/xray-core/common/userkill"
 	"strings"
 	"sync"
 	"time"
@@ -255,6 +256,32 @@ func withTorrentGuard(ctx context.Context) context.Context {
 		torrentguard.NewDeferred(ctx, speedlimit.Username(inbound.User.Email), sourceIP))
 }
 
+// trackUserKill registers this stream of an authenticated user in
+// common/userkill so the panel can tear it down when the user is blocked
+// (Marzban patch). A user killed a moment ago is refused right here.
+func trackUserKill(ctx context.Context, links ...*transport.Link) error {
+	inbound := session.InboundFromContext(ctx)
+	if inbound == nil || inbound.User == nil || inbound.User.Email == "" {
+		return nil
+	}
+	closeAll := func() {
+		if inbound.Conn != nil {
+			inbound.Conn.Close()
+		}
+		for _, l := range links {
+			common.Close(l.Writer)
+			common.Interrupt(l.Writer)
+			common.Interrupt(l.Reader)
+		}
+	}
+	if userkill.Blocked(inbound.User.Email) {
+		closeAll()
+		return errors.New("user ", inbound.User.Email, " was removed, connection refused")
+	}
+	userkill.Track(ctx, inbound.User.Email, closeAll)
+	return nil
+}
+
 func trackOnlineIP(ctx context.Context, sm stats.Manager, email, ip string) {
 	name := "user>>>" + email + ">>>online"
 	if om, _ := sm.GetOrRegisterOnlineMap(name); om != nil {
@@ -319,6 +346,9 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	sniffingRequest := content.SniffingRequest
 	ctx = withTorrentGuard(ctx)
 	inbound, outbound := d.getLink(ctx)
+	if err := trackUserKill(ctx, inbound, outbound); err != nil {
+		return nil, err
+	}
 	if !sniffingRequest.Enabled {
 		go d.routedDispatch(ctx, outbound, destination)
 	} else {
@@ -375,6 +405,9 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	}
 	ctx = withTorrentGuard(ctx)
 	outbound = WrapLink(ctx, d.policy, d.stats, outbound)
+	if err := trackUserKill(ctx, outbound); err != nil {
+		return err
+	}
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled {
 		d.routedDispatch(ctx, outbound, destination)
