@@ -259,6 +259,14 @@ func withTorrentGuard(ctx context.Context) context.Context {
 // trackUserKill registers this stream of an authenticated user in
 // common/userkill so the panel can tear it down when the user is blocked
 // (Marzban patch). A user killed a moment ago is refused right here.
+const btKindAttr = "marzban.bt_kind"
+
+func setBTKind(content *session.Content, result SniffResult) {
+	if k, ok := result.(interface{ BTKind() string }); ok && k.BTKind() != "" {
+		content.SetAttribute(btKindAttr, k.BTKind())
+	}
+}
+
 func trackUserKill(ctx context.Context, links ...*transport.Link) error {
 	inbound := session.InboundFromContext(ctx)
 	if inbound == nil || inbound.User == nil || inbound.User.Email == "" {
@@ -360,6 +368,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
 			if err == nil {
 				content.Protocol = result.Protocol()
+				setBTKind(content, result)
 			}
 			if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
 				domain := result.Domain()
@@ -419,6 +428,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
 		if err == nil {
 			content.Protocol = result.Protocol()
+			setBTKind(content, result)
 		}
 		if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
 			domain := result.Domain()
@@ -571,6 +581,21 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			}
 		}
 		log.Record(accessMessage)
+	}
+
+	// Marzban patch: a BitTorrent signature (handshake, DHT, uTP, tracker)
+	// is reported to the panel even when routing blackholes the connection —
+	// the client then falls back to encrypted peers and the block alone would
+	// stay invisible.
+	if content := session.ContentFromContext(ctx); content != nil && content.Protocol == "bittorrent" {
+		if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.User != nil && inbound.User.Email != "" {
+			var src string
+			if inbound.Source.IsValid() {
+				src = inbound.Source.Address.String()
+			}
+			torrentguard.ReportSignature(speedlimit.Username(inbound.User.Email), src,
+				content.Attribute(btKindAttr), destination.Address.String())
+		}
 	}
 
 	// Marzban patch: torrentguard for outbounds other than freedom (freedom

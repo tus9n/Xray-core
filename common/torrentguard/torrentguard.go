@@ -107,6 +107,7 @@ func init() {
 	localpush.Register("/torrent-guard", handlePush)
 	if localpush.IsRunCommand() {
 		go idleSweeper()
+		go sigFlusher()
 	}
 }
 

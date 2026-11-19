@@ -137,6 +137,15 @@ func (c compositeResult) ProtocolForDomainResult() string {
 	return c.domainResult.Protocol()
 }
 
+// BTKind passes the BitTorrent signature kind through a composite result
+// (Marzban patch, see btKind in default.go).
+func (c compositeResult) BTKind() string {
+	if k, ok := c.protocolResult.(interface{ BTKind() string }); ok {
+		return k.BTKind()
+	}
+	return ""
+}
+
 type SnifferResultComposite interface {
 	ProtocolForDomainResult() string
 }

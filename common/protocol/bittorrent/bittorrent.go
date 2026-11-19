@@ -9,10 +9,18 @@ import (
 	"github.com/xtls/xray-core/common"
 )
 
-type SniffHeader struct{}
+type SniffHeader struct {
+	kind string
+}
 
 func (h *SniffHeader) Protocol() string {
 	return "bittorrent"
+}
+
+// BTKind names which signature matched (Marzban patch, reported by
+// common/torrentguard): handshake, utp, udp_tracker, dht, lsd, http_tracker.
+func (h *SniffHeader) BTKind() string {
+	return h.kind
 }
 
 func (h *SniffHeader) Domain() string {
@@ -27,7 +35,7 @@ func SniffBittorrent(b []byte) (*SniffHeader, error) {
 	}
 
 	if b[0] == 19 && string(b[1:20]) == "BitTorrent protocol" {
-		return &SniffHeader{}, nil
+		return &SniffHeader{kind: "handshake"}, nil
 	}
 
 	return nil, errNotBittorrent
@@ -79,7 +87,7 @@ func SniffUTP(b []byte) (*SniffHeader, error) {
 		return nil, errNotBittorrent
 	}
 
-	return &SniffHeader{}, nil
+	return &SniffHeader{kind: "utp"}, nil
 }
 
 // SniffUDPTracker matches a BEP-15 UDP tracker "connect" request: an 8-byte
@@ -96,7 +104,7 @@ func SniffUDPTracker(b []byte) (*SniffHeader, error) {
 		return nil, errNotBittorrent
 	}
 
-	return &SniffHeader{}, nil
+	return &SniffHeader{kind: "udp_tracker"}, nil
 }
 
 // SniffDHT matches a Mainline DHT (BEP-5) bencoded krpc message by its
@@ -116,7 +124,7 @@ func SniffDHT(b []byte) (*SniffHeader, error) {
 
 	for _, p := range dhtPrefixes {
 		if bytes.HasPrefix(b, p) {
-			return &SniffHeader{}, nil
+			return &SniffHeader{kind: "dht"}, nil
 		}
 	}
 
@@ -133,7 +141,7 @@ func SniffLSD(b []byte) (*SniffHeader, error) {
 	}
 
 	if bytes.HasPrefix(b, lsdPrefix) {
-		return &SniffHeader{}, nil
+		return &SniffHeader{kind: "lsd"}, nil
 	}
 
 	return nil, errNotBittorrent
@@ -180,5 +188,5 @@ func SniffHTTPTracker(b []byte) (*SniffHeader, error) {
 		return nil, errNotBittorrent
 	}
 
-	return &SniffHeader{}, nil
+	return &SniffHeader{kind: "http_tracker"}, nil
 }
