@@ -56,6 +56,13 @@ type remoteConfig struct {
 	Action              string   `json:"action"` // "throttle" | "drop"
 	ThrottleMbps        float64  `json:"throttle_mbps"`
 	ExemptUsers         []string `json:"exempt_users"`
+
+	// Quarantine on a sniffed signature, see quarantine.go
+	QuarantineEnabled    bool  `json:"quarantine_enabled"`
+	QuarantineMin        int   `json:"quarantine_min"`
+	QuarantineHits       int   `json:"quarantine_hits"`
+	QuarantineWindowMin  int   `json:"quarantine_window_min"`
+	QuarantineAllowPorts []int `json:"quarantine_allow_ports"`
 }
 
 var (
@@ -96,6 +103,8 @@ func handlePush(w http.ResponseWriter, r *http.Request) {
 	// the panel's own exempt/clear action is that manual lift, delivered as
 	// a push same as everything else here.
 	clearEnforcementFor(exempt)
+	clearQuarantineFor(exempt)
+	setQuarantineConfig(next)
 
 	hasConfigMu.Lock()
 	hasConfig = true
@@ -108,6 +117,7 @@ func init() {
 	if localpush.IsRunCommand() {
 		go idleSweeper()
 		go sigFlusher()
+		go quarantineSweeper()
 	}
 }
 

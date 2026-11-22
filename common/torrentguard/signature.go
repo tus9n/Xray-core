@@ -50,6 +50,8 @@ func ReportSignature(username, sourceIP, kind, dest string) {
 	if kind == "" {
 		kind = "bittorrent"
 	}
+	// quarantine first: its line precedes the signature line in the log
+	noteSignature(username, sourceIP, kind)
 	now := time.Now()
 	k := key(username, sourceIP)
 
