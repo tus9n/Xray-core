@@ -293,21 +293,20 @@ func trackUserKill(ctx context.Context, links ...*transport.Link) error {
 // refuseQuarantined applies torrentguard.QuarantineGate to a connection about
 // to be handed to handler. The target is the one the client asked for, before
 // any sniffing override: peers are bare IPs, sites are domains or TLS/HTTP.
-func refuseQuarantined(ctx context.Context, handler outbound.Handler, link *transport.Link, content *session.Content) bool {
-	if u, ok := handler.(interface{ TorrentGuardUntracked() bool }); ok && u.TorrentGuardUntracked() {
-		return false
-	}
+func refuseQuarantined(ctx context.Context, link *transport.Link, content *session.Content) (bool, context.Context) {
+	// every outbound, freedom included (freedom is "untracked" only for the
+	// fan-out counting, which it does itself)
 	inbound := session.InboundFromContext(ctx)
 	if inbound == nil || inbound.User == nil || inbound.User.Email == "" {
-		return false
+		return false, ctx
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
-		return false
+		return false, ctx
 	}
 	target := outbounds[len(outbounds)-1].OriginalTarget
 	if !target.IsValid() {
-		return false
+		return false, ctx
 	}
 	var src, protocol string
 	if inbound.Source.IsValid() {
@@ -636,7 +635,8 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	// Marzban patch: torrent quarantine — a pair caught with a BitTorrent
 	// signature gets no connections to bare IPs on non-web ports for a while
 	// (encrypted peers), see common/torrentguard/quarantine.go.
-	if refuseQuarantined(ctx, handler, link, session.ContentFromContext(ctx)) {
+	var refuse bool
+	if refuse, ctx = refuseQuarantined(ctx, link, session.ContentFromContext(ctx)); refuse {
 		errors.LogInfo(ctx, "torrentguard: refusing connection to ", destination, " (quarantine)")
 		common.Close(link.Writer)
 		common.Interrupt(link.Reader)

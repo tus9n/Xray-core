@@ -164,26 +164,71 @@ func webProtocol(p string) bool {
 	return false
 }
 
+// closerHolder gathers the ways to tear one connection down: the dispatcher's
+// pipes and, once dialed, the outbound socket itself (freedom splices raw
+// sockets past the pipes, so closing the pipes alone leaves it running).
+type closerHolder struct {
+	mu     sync.Mutex
+	fns    []func()
+	closed bool
+}
+
+func (h *closerHolder) add(f func()) {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		f()
+		return
+	}
+	h.fns = append(h.fns, f)
+	h.mu.Unlock()
+}
+
+func (h *closerHolder) run() {
+	h.mu.Lock()
+	h.closed = true
+	fns := h.fns
+	h.fns = nil
+	h.mu.Unlock()
+	for _, f := range fns {
+		func() {
+			defer func() { _ = recover() }()
+			f()
+		}()
+	}
+}
+
+type holderKey struct{}
+
+// AttachConn lets a quarantine close the dialed outbound connection of this
+// dispatch too (no-op unless QuarantineGate remembered the connection).
+func AttachConn(ctx context.Context, c interface{ Close() error }) {
+	if h, _ := ctx.Value(holderKey{}).(*closerHolder); h != nil && c != nil {
+		h.add(func() { _ = c.Close() })
+	}
+}
+
 // QuarantineGate decides about a new connection of (username, sourceIP) to a
 // destination addressed by IP (isIP) or domain on port, sniffed as protocol.
 // Returns true when the pair is quarantined and the connection must be
 // refused. Otherwise a connection that quarantine would cut is remembered
 // with closer, so a quarantine starting later closes it; it is forgotten
-// when ctx ends.
+// when ctx ends. The returned context must be used for the rest of the
+// dispatch: the outbound attaches its socket to it (AttachConn).
 func QuarantineGate(ctx context.Context, username, sourceIP string, isIP bool, port int,
-	protocol string, closer func()) bool {
+	protocol string, closer func()) (bool, context.Context) {
 	if username == "" || !isIP || webProtocol(protocol) {
-		return false
+		return false, ctx
 	}
 	q := quarantineConfig()
 	if !q.on {
-		return false
+		return false, ctx
 	}
 	if _, ok := q.allow[port]; ok {
-		return false
+		return false, ctx
 	}
 	if !Enabled() || isExempt(username) {
-		return false
+		return false, ctx
 	}
 	k := key(username, sourceIP)
 	now := time.Now()
@@ -192,11 +237,7 @@ func QuarantineGate(ctx context.Context, username, sourceIP string, isIP bool, p
 	st := qStates[k]
 	if st != nil && now.Before(st.until) {
 		qMu.Unlock()
-		return true
-	}
-	if closer == nil {
-		qMu.Unlock()
-		return false
+		return true, ctx
 	}
 	if st == nil {
 		st = &quarState{}
@@ -205,7 +246,11 @@ func QuarantineGate(ctx context.Context, username, sourceIP string, isIP bool, p
 	if st.conns == nil {
 		st.conns = map[*qConn]struct{}{}
 	}
-	c := &qConn{close: closer}
+	h := &closerHolder{}
+	if closer != nil {
+		h.add(closer)
+	}
+	c := &qConn{close: h.run}
 	st.conns[c] = struct{}{}
 	qMu.Unlock()
 
@@ -219,7 +264,7 @@ func QuarantineGate(ctx context.Context, username, sourceIP string, isIP bool, p
 		}
 		qMu.Unlock()
 	})
-	return false
+	return false, context.WithValue(ctx, holderKey{}, h)
 }
 
 // Quarantined reports whether the pair is quarantined right now.

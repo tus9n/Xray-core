@@ -426,6 +426,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}
 	defer conn.Close()
+	// Marzban patch: a torrent quarantine closes this socket (splice bypasses the pipes)
+	torrentguard.AttachConn(ctx, conn)
 	errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
 	// Marzban patch: register this connection with torrentguard using the
