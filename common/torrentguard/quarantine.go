@@ -3,6 +3,7 @@ package torrentguard
 import (
 	"context"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,9 +25,21 @@ import (
 //	TORRENTGUARD_QUARANTINE user=<username> src=<ip> min=<n> killed=<n> kinds=dht:1
 //
 // is logged once when a quarantine starts. Every further strong signature
-// during the quarantine extends it.
+// during the quarantine extends it. Refused connections are reported as
+//
+//	TORRENTGUARD_REFUSED user=<username> src=<ip> refused=<n> peers=<n> left=<sec> sample=udp:1.2.3.4:6881,...
+//
+// the first one at once, later ones summed up at most once per
+// refusedLogEvery for the pair (refused — connections since the previous
+// line, peers — distinct destinations among them, left — seconds of
+// quarantine remaining, sample — up to refusedSample destinations).
 
 var defaultAllowPorts = []int{53, 80, 443, 853}
+
+const (
+	refusedLogEvery = 30 * time.Second
+	refusedSample   = 3
+)
 
 type qConn struct {
 	close func()
@@ -37,6 +50,12 @@ type quarState struct {
 	hits  []time.Time
 	kinds map[string]int
 	conns map[*qConn]struct{}
+
+	// refused connections not yet logged
+	refused int
+	rPeers  map[string]struct{}
+	rSample []string
+	rLast   time.Time
 }
 
 var (
@@ -216,7 +235,7 @@ func AttachConn(ctx context.Context, c interface{ Close() error }) {
 // when ctx ends. The returned context must be used for the rest of the
 // dispatch: the outbound attaches its socket to it (AttachConn).
 func QuarantineGate(ctx context.Context, username, sourceIP string, isIP bool, port int,
-	protocol string, closer func()) (bool, context.Context) {
+	protocol, dest string, closer func()) (bool, context.Context) {
 	if username == "" || !isIP || webProtocol(protocol) {
 		return false, ctx
 	}
@@ -236,7 +255,11 @@ func QuarantineGate(ctx context.Context, username, sourceIP string, isIP bool, p
 	qMu.Lock()
 	st := qStates[k]
 	if st != nil && now.Before(st.until) {
+		line := noteRefused(username, sourceIP, st, dest, now)
 		qMu.Unlock()
+		if line != "" {
+			errors.LogWarning(context.Background(), line)
+		}
 		return true, ctx
 	}
 	if st == nil {
@@ -265,6 +288,61 @@ func QuarantineGate(ctx context.Context, username, sourceIP string, isIP bool, p
 		qMu.Unlock()
 	})
 	return false, context.WithValue(ctx, holderKey{}, h)
+}
+
+// noteRefused counts a refused connection of a quarantined pair and returns
+// the log line when it is due; called under qMu.
+func noteRefused(username, sourceIP string, st *quarState, dest string, now time.Time) string {
+	if st.rPeers == nil {
+		st.rPeers = map[string]struct{}{}
+	}
+	st.refused++
+	if dest != "" {
+		if _, seen := st.rPeers[dest]; !seen && len(st.rPeers) < 10000 {
+			st.rPeers[dest] = struct{}{}
+			if len(st.rSample) < refusedSample {
+				st.rSample = append(st.rSample, dest)
+			}
+		}
+	}
+	if now.Sub(st.rLast) < refusedLogEvery {
+		return ""
+	}
+	return takeRefused(username, sourceIP, st, now)
+}
+
+// takeRefused formats and resets the pending refusals; called under qMu.
+func takeRefused(username, sourceIP string, st *quarState, now time.Time) string {
+	left := 0
+	if now.Before(st.until) {
+		left = int(st.until.Sub(now) / time.Second)
+	}
+	line := "TORRENTGUARD_REFUSED user=" + username + " src=" + sourceIP +
+		" refused=" + strconv.Itoa(st.refused) + " peers=" + strconv.Itoa(len(st.rPeers)) +
+		" left=" + strconv.Itoa(left) + " sample=" + strings.Join(st.rSample, ",")
+	st.refused, st.rPeers, st.rSample, st.rLast = 0, nil, nil, now
+	return line
+}
+
+// refusedFlusher logs refusals left pending when they stopped right after a
+// line: without it they would wait for the next refusal forever.
+func refusedFlusher() {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for now := range t.C {
+		var lines []string
+		qMu.Lock()
+		for k, st := range qStates {
+			if st.refused > 0 && now.Sub(st.rLast) >= refusedLogEvery {
+				user, src, _ := strings.Cut(k, "\x00")
+				lines = append(lines, takeRefused(user, src, st, now))
+			}
+		}
+		qMu.Unlock()
+		for _, l := range lines {
+			errors.LogWarning(context.Background(), l)
+		}
+	}
 }
 
 // Quarantined reports whether the pair is quarantined right now.
@@ -300,7 +378,7 @@ func quarantineSweeper() {
 		window := quarantineConfig().window
 		qMu.Lock()
 		for k, st := range qStates {
-			if len(st.conns) > 0 || now.Before(st.until) {
+			if len(st.conns) > 0 || now.Before(st.until) || st.refused > 0 {
 				continue
 			}
 			if n := len(st.hits); n > 0 && now.Sub(st.hits[n-1]) <= window {

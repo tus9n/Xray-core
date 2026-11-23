@@ -118,6 +118,7 @@ func init() {
 		go idleSweeper()
 		go sigFlusher()
 		go quarantineSweeper()
+		go refusedFlusher()
 	}
 }
 

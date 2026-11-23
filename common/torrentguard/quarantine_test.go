@@ -2,13 +2,14 @@ package torrentguard
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func gate(ctx context.Context, user, src string, isIP bool, port int, proto string, closer func()) bool {
-	r, _ := QuarantineGate(ctx, user, src, isIP, port, proto, closer)
+	r, _ := QuarantineGate(ctx, user, src, isIP, port, proto, "", closer)
 	return r
 }
 
@@ -104,7 +105,7 @@ func TestQuarantine_ClosesAttachedConn(t *testing.T) {
 	resetQuarantine()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_, gctx := QuarantineGate(ctx, "frank", "1.2.3.4", true, 51413, "", nil)
+	_, gctx := QuarantineGate(ctx, "frank", "1.2.3.4", true, 51413, "", "", nil)
 	conn := &fakeConn{}
 	AttachConn(gctx, conn)
 	ReportSignature("frank", "1.2.3.4", "dht", "5.6.7.8:6881")
@@ -115,5 +116,42 @@ func TestQuarantine_ClosesAttachedConn(t *testing.T) {
 	AttachConn(gctx, late)
 	if late.closed.Load() != 1 {
 		t.Fatal("socket attached after quarantine must be closed at once")
+	}
+}
+
+func TestQuarantine_RefusedLine(t *testing.T) {
+	pushConfig(t, `{"enabled":true,"window_sec":20,"symmetry_ratio_min":0.8,"max_unique_ips_alert":60,"max_unique_ips_enforce":1000000,"action":"throttle","quarantine_enabled":true,"quarantine_min":30}`)
+	resetQuarantine()
+	ReportSignature("gina", "1.2.3.5", "dht", "5.6.7.8:6881")
+	ctx := context.Background()
+	refuse := func(dest string) {
+		if r, _ := QuarantineGate(ctx, "gina", "1.2.3.5", true, 40000, "", dest, nil); !r {
+			t.Fatal("must be refused in quarantine")
+		}
+	}
+	refuse("udp:9.9.9.1:40000")
+	qMu.Lock()
+	st := qStates[key("gina", "1.2.3.5")]
+	if st.refused != 0 || st.rLast.IsZero() {
+		qMu.Unlock()
+		t.Fatalf("first refusal must be logged at once: refused=%d", st.refused)
+	}
+	qMu.Unlock()
+	for _, d := range []string{"udp:9.9.9.2:40000", "udp:9.9.9.2:40000", "tcp:9.9.9.3:40000", "udp:9.9.9.4:1", "udp:9.9.9.5:1"} {
+		refuse(d)
+	}
+	qMu.Lock()
+	if st.refused != 5 || len(st.rPeers) != 4 || len(st.rSample) != refusedSample {
+		t.Fatalf("pending: refused=%d peers=%d sample=%v", st.refused, len(st.rPeers), st.rSample)
+	}
+	st.until = time.Now().Add(90 * time.Second)
+	line := takeRefused("gina", "1.2.3.5", st, time.Now())
+	qMu.Unlock()
+	want := "TORRENTGUARD_REFUSED user=gina src=1.2.3.5 refused=5 peers=4 left=89 sample=udp:9.9.9.2:40000,tcp:9.9.9.3:40000,udp:9.9.9.4:1"
+	if line != want && line != strings.Replace(want, "left=89", "left=90", 1) {
+		t.Fatalf("line:\n%s\nwant\n%s", line, want)
+	}
+	if st.refused != 0 || st.rPeers != nil || st.rSample != nil {
+		t.Fatal("take must reset pending refusals")
 	}
 }

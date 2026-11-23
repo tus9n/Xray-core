@@ -321,7 +321,7 @@ func refuseQuarantined(ctx context.Context, link *transport.Link, content *sessi
 		common.Interrupt(link.Reader)
 	}
 	return torrentguard.QuarantineGate(ctx, speedlimit.Username(inbound.User.Email), src,
-		target.Address.Family().IsIP(), int(target.Port), protocol, closer)
+		target.Address.Family().IsIP(), int(target.Port), protocol, target.String(), closer)
 }
 
 func trackOnlineIP(ctx context.Context, sm stats.Manager, email, ip string) {
