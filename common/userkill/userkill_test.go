@@ -39,3 +39,28 @@ func TestUntrackOnDone(t *testing.T) {
 		t.Fatalf("finished stream must be untracked: n=%d", n)
 	}
 }
+
+func TestKillPairs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var a, b, c atomic.Int32
+	TrackFrom(ctx, "5.dave#VL3", "1.2.3.4", func() { a.Add(1) })
+	TrackFrom(ctx, "5.dave#VL10", "::ffff:1.2.3.4", func() { b.Add(1) })
+	TrackFrom(ctx, "5.dave#VL3", "5.6.7.8", func() { c.Add(1) })
+
+	if n := KillPairs([]Pair{{User: "dave", IP: "1.2.3.4"}}, 0); n != 2 || a.Load() != 1 || b.Load() != 1 {
+		t.Fatalf("pair kill: n=%d a=%d b=%d", n, a.Load(), b.Load())
+	}
+	if c.Load() != 0 {
+		t.Fatal("other device of the same user must stay")
+	}
+	if !BlockedFrom("5.dave#VL4", "1.2.3.4") {
+		t.Fatal("killed pair must be refused")
+	}
+	if BlockedFrom("5.dave#VL3", "5.6.7.8") || Blocked("5.dave#VL3") {
+		t.Fatal("other address / whole user must not be refused")
+	}
+	if n := KillPairs([]Pair{{User: "6.erin#VL3", IP: "9.9.9.9"}}, 0); n != 0 {
+		t.Fatalf("nothing tracked: n=%d", n)
+	}
+}

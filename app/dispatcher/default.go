@@ -282,11 +282,15 @@ func trackUserKill(ctx context.Context, links ...*transport.Link) error {
 			common.Interrupt(l.Reader)
 		}
 	}
-	if userkill.Blocked(inbound.User.Email) {
+	src := ""
+	if inbound.Source.Address != nil {
+		src = inbound.Source.Address.String()
+	}
+	if userkill.BlockedFrom(inbound.User.Email, src) {
 		closeAll()
 		return errors.New("user ", inbound.User.Email, " was removed, connection refused")
 	}
-	userkill.Track(ctx, inbound.User.Email, closeAll)
+	userkill.TrackFrom(ctx, inbound.User.Email, src, closeAll)
 	return nil
 }
 
